@@ -1,0 +1,1 @@
+{"budgets":{"max_calls":50,"max_cost":5.0,"max_seconds":300},"name":"read-only-agent","rules":[{"action":"list","effect":"allow","id":"allow-list-workspace","resource":"workspace/*","tool":"files"},{"action":"read","effect":"allow","id":"allow-read-workspace","resource":"workspace/*","tool":"files"}],"secret_scopes":{},"sensitive_actions":["delete"],"version":1}

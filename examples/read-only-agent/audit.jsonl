@@ -1,0 +1,4 @@
+{"action": "list", "actor": "read-only-agent", "decision": "allow", "detail": "cost=0.0", "outcome": "ok", "resource": "workspace/.", "run_id": "run-1", "tool": "files", "ts": "2026-11-11T10:09:38.350727+00:00"}
+{"action": "read", "actor": "read-only-agent", "decision": "allow", "detail": "cost=0.01", "outcome": "ok", "resource": "workspace/notes.txt", "run_id": "run-1", "tool": "files", "ts": "2026-11-11T10:09:38.350987+00:00"}
+{"action": "read", "actor": "read-only-agent", "decision": "deny", "detail": "Denied by default: no allow rule matches this call", "outcome": "blocked", "resource": "/etc/passwd", "run_id": "run-1", "tool": "files", "ts": "2026-11-11T10:09:38.351084+00:00"}
+{"action": "delete", "actor": "read-only-agent", "decision": "deny", "detail": "Denied by default: no allow rule matches this call", "outcome": "blocked", "resource": "workspace/notes.txt", "run_id": "run-1", "tool": "files", "ts": "2026-11-11T10:09:38.351168+00:00"}

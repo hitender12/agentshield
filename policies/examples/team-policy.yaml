@@ -1,0 +1,73 @@
+# Team policy: environment separation for staging vs production.
+# Staging is the working environment (DB queries, deploys, and deletes
+# allowed there; deploys and deletes are sensitive, so they still need
+# a human approval). Production is read-only for files and fully closed
+# for DB queries and deploys, even with an approval. Issue reads are
+# scoped to project team-alpha. Equivalent to team-policy.json.
+name: team-policy
+version: 1
+sensitive_actions:
+  - delete
+  - run
+  - send
+  - buy
+budgets:
+  max_calls: 100
+  max_seconds: 600
+  max_cost: 10.0
+secret_scopes:
+  DB_PASSWORD:
+    - db
+rules:
+  - id: allow-files-list
+    effect: allow
+    tool: files
+    action: list
+    resource: workspace/*
+  - id: allow-files-read
+    effect: allow
+    tool: files
+    action: read
+    resource: workspace/*
+  - id: allow-db-staging
+    effect: allow
+    tool: db
+    action: query
+    resource: staging.*
+    environment: staging
+  - id: deny-db-prod
+    effect: deny
+    tool: db
+    action: query
+    resource: prod.*
+    environment: prod
+  - id: allow-deploy-staging
+    effect: allow
+    tool: deploy
+    action: run
+    resource: staging
+    environment: staging
+  - id: deny-deploy-prod
+    effect: deny
+    tool: deploy
+    action: run
+    resource: prod
+    environment: prod
+  - id: allow-files-delete-staging
+    effect: allow
+    tool: files
+    action: delete
+    resource: workspace/*
+    environment: staging
+  - id: deny-files-delete-prod
+    effect: deny
+    tool: files
+    action: delete
+    resource: workspace/*
+    environment: prod
+  - id: allow-issues-read-team-alpha
+    effect: allow
+    tool: issues
+    action: read
+    resource: '*'
+    project: team-alpha

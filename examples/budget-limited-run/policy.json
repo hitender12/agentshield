@@ -1,0 +1,1 @@
+{"budgets":{"max_calls":3,"max_cost":0.03,"max_seconds":300},"name":"budget-limited-run","rules":[{"action":"list","effect":"allow","id":"allow-list-workspace","resource":"workspace/*","tool":"files"},{"action":"read","effect":"allow","id":"allow-read-workspace","resource":"workspace/*","tool":"files"}],"secret_scopes":{},"sensitive_actions":[],"version":1}

@@ -1,0 +1,68 @@
+# Strict read-only policy: an agent may look, but never change anything.
+# Listing/reading the workspace, read-only staging DB queries, and
+# reading issues are allowed. Every write, delete, deploy, shell exec,
+# and production DB query is denied (explicit deny rules, plus default
+# deny for anything unlisted). Equivalent to strict-readonly.json.
+name: strict-readonly
+version: 1
+sensitive_actions:
+  - delete
+  - run
+  - send
+  - buy
+  - write
+budgets:
+  max_calls: 20
+  max_seconds: 300
+  max_cost: 1.0
+secret_scopes:
+  DB_PASSWORD:
+    - db
+rules:
+  - id: allow-files-list
+    effect: allow
+    tool: files
+    action: list
+    resource: workspace/*
+  - id: allow-files-read
+    effect: allow
+    tool: files
+    action: read
+    resource: workspace/*
+  - id: allow-db-staging-read
+    effect: allow
+    tool: db
+    action: query
+    resource: staging.*
+    environment: staging
+  - id: allow-issues-read
+    effect: allow
+    tool: issues
+    action: read
+    resource: '*'
+  - id: deny-files-write
+    effect: deny
+    tool: files
+    action: write
+    resource: workspace/*
+  - id: deny-files-delete
+    effect: deny
+    tool: files
+    action: delete
+    resource: workspace/*
+  - id: deny-deploy-any
+    effect: deny
+    tool: deploy
+    action: run
+    resource: '*'
+  - id: deny-shell-exec
+    effect: deny
+    tool: shell
+    action: exec
+    resource: '*'
+  - id: deny-db-prod
+    effect: deny
+    tool: db
+    action: query
+    resource: prod.*
+    environment: prod
