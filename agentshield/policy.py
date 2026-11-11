@@ -9,8 +9,11 @@ YAML subset supported (deliberately small — this is NOT a full YAML parser):
 - ``key: value`` pairs (strings, ints, floats, booleans, null)
 - nested mappings by indentation
 - lists with ``- item`` and ``- key: value`` (list of maps)
+- flow collections: ``[a, b]`` and ``{k: v}`` (parsed, not left as strings)
 - ``#`` full-line comments, and `` #`` trailing comments outside quotes
 - single- and double-quoted strings
+- duplicate mapping keys are rejected (last-win would silently change
+  the policy)
 
 Anything outside that subset raises :class:`PolicyError`. Do not feed this
 reader arbitrary YAML and expect it to work; use JSON for complex policies.
@@ -68,9 +71,19 @@ class Rule:
             effect = data["effect"]
         except KeyError as exc:
             raise PolicyError(f"rule missing required field: {exc}") from exc
+        if not isinstance(rule_id, str) or not rule_id:
+            raise PolicyError(f"rule id must be a non-empty string, got {rule_id!r}")
+        if not isinstance(effect, str):
+            raise PolicyError(f"rule {rule_id!r}: effect must be a string, got {effect!r}")
         unknown = set(data) - {"id", "effect"} - set(MATCH_FIELDS)
         if unknown:
             raise PolicyError(f"rule {rule_id!r}: unknown fields {sorted(unknown)}")
+        for field in MATCH_FIELDS:
+            value = data.get(field)
+            if value is not None and not isinstance(value, str):
+                raise PolicyError(
+                    f"rule {rule_id!r}: field {field!r} must be a string "
+                    f"glob pattern, got {type(value).__name__} {value!r}")
         return cls(rule_id, effect, **{f: data.get(f) for f in MATCH_FIELDS})
 
 
@@ -79,6 +92,40 @@ class Policy:
 
     def __init__(self, name, rules, sensitive_actions=(), budgets=None,
                  secret_scopes=None, version=1):
+        if not isinstance(name, str):
+            raise PolicyError(f"policy name must be a string, got {name!r}")
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise PolicyError(f"policy version must be an integer, got {version!r}")
+        if isinstance(sensitive_actions, str) or not isinstance(
+                sensitive_actions, (list, tuple)):
+            raise PolicyError(
+                "sensitive_actions must be a list of action names, "
+                f"got {sensitive_actions!r} — a bare string would be read "
+                "as single characters and silently disable approvals")
+        for action in sensitive_actions:
+            if not isinstance(action, str):
+                raise PolicyError(
+                    f"sensitive_actions must contain strings, got {action!r}")
+        if budgets is not None and not isinstance(budgets, dict):
+            raise PolicyError(f"budgets must be a mapping, got {budgets!r}")
+        for key, value in (budgets or {}).items():
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise PolicyError(
+                    f"budgets[{key!r}] must be a number, got {value!r}")
+        if secret_scopes is not None and not isinstance(secret_scopes, dict):
+            raise PolicyError(
+                f"secret_scopes must be a mapping, got {secret_scopes!r}")
+        for secret, tools in (secret_scopes or {}).items():
+            if isinstance(tools, str) or not isinstance(tools, (list, tuple)):
+                raise PolicyError(
+                    f"secret_scopes[{secret!r}] must be a list of tool names, "
+                    f"got {tools!r} — a bare string would be read as single "
+                    "characters and silently break scoping")
+            for tool in tools:
+                if not isinstance(tool, str):
+                    raise PolicyError(
+                        f"secret_scopes[{secret!r}] must contain strings, "
+                        f"got {tool!r}")
         self.name = name
         self.version = version
         self.rules = list(rules)
@@ -98,6 +145,8 @@ class Policy:
             raise PolicyError("policy must be a mapping")
         if "rules" not in data or not isinstance(data["rules"], list):
             raise PolicyError("policy must contain a 'rules' list")
+        if not data["rules"]:
+            raise PolicyError("policy must contain at least one rule")
         rules = [Rule.from_dict(r) for r in data["rules"]]
         ids = [r.id for r in rules]
         if len(set(ids)) != len(ids):
@@ -151,6 +200,55 @@ def _strip_comment(line):
     return line.rstrip()
 
 
+def _split_flow(inner):
+    """Split a flow-collection body on top-level commas.
+
+    Respects quotes and nesting, so ``[a, "b, c", [d, e]]`` splits into
+    three items. Returns the raw item strings (still to be scalar-parsed).
+    """
+    parts, depth, in_single, in_double, current = [], 0, False, False, ""
+    for ch in inner:
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch in "[{":
+                depth += 1
+            elif ch in "]}":
+                depth -= 1
+                if depth < 0:
+                    raise PolicyError("YAML subset: unbalanced brackets in flow collection")
+            elif ch == "," and depth == 0:
+                parts.append(current)
+                current = ""
+                continue
+        current += ch
+    if depth != 0:
+        raise PolicyError("YAML subset: unbalanced brackets in flow collection")
+    parts.append(current)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _parse_flow(token):
+    """Parse a flow collection token: ``[a, b]`` or ``{k: v, ...}``."""
+    if token.startswith("[") and token.endswith("]"):
+        return [_scalar(item) for item in _split_flow(token[1:-1])]
+    if token.startswith("{") and token.endswith("}"):
+        mapping = {}
+        for item in _split_flow(token[1:-1]):
+            if ":" not in item:
+                raise PolicyError(
+                    f"YAML subset: expected 'key: value' in flow mapping, got {item!r}")
+            key, _, rest = item.partition(":")
+            key = key.strip()
+            if key in mapping:
+                raise PolicyError(f"YAML subset: duplicate key {key!r}")
+            mapping[key] = _scalar(rest.strip())
+        return mapping
+    raise PolicyError(f"YAML subset: malformed flow collection {token!r}")
+
+
 def _scalar(token):
     token = token.strip()
     if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
@@ -161,6 +259,13 @@ def _scalar(token):
         return False
     if token in ("null", "~", ""):
         return None
+    if token.startswith("[") or token.startswith("{"):
+        # Flow collection. A token that opens but never closes is a
+        # syntax error, not a plain string.
+        if (token.startswith("[") and token.endswith("]")) or \
+                (token.startswith("{") and token.endswith("}")):
+            return _parse_flow(token)
+        raise PolicyError(f"YAML subset: unbalanced flow collection {token!r}")
     try:
         return int(token)
     except ValueError:
@@ -207,6 +312,8 @@ def _parse_block(lines, pos, indent):
             raise PolicyError(f"YAML subset: expected 'key: value', got: {content!r}")
         key, _, rest = content.partition(":")
         key = key.strip()
+        if key in mapping:
+            raise PolicyError(f"YAML subset: duplicate key {key!r}")
         rest = rest.strip()
         if rest:
             mapping[key] = _scalar(rest)
@@ -247,7 +354,10 @@ def _parse_list(lines, pos, indent):
             cont_indent = ind + 2
             while pos < len(lines) and lines[pos][0] == cont_indent and ":" in lines[pos][1]:
                 k, _, v = lines[pos][1].partition(":")
-                item[k.strip()] = _scalar(v.strip()) if v.strip() else None
+                k = k.strip()
+                if k in item:
+                    raise PolicyError(f"YAML subset: duplicate key {k!r}")
+                item[k] = _scalar(v.strip()) if v.strip() else None
                 pos += 1
             items.append(item)
         else:

@@ -35,7 +35,11 @@ class FakeTools:
 
     # -- path safety: a tool may only touch paths inside base_dir --------
     def _safe_path(self, rel):
-        target = os.path.abspath(os.path.join(self.base_dir, rel or "."))
+        # realpath (not abspath) resolves every symlink component, so a
+        # symlink inside the workspace that points outside it is caught
+        # here instead of being followed into the outside file. The
+        # containment check runs on the *resolved* path.
+        target = os.path.realpath(os.path.join(self.base_dir, rel or "."))
         if target != self.base_dir and not target.startswith(self.base_dir + os.sep):
             raise ToolError(f"path escapes workspace: {rel!r}")
         return target

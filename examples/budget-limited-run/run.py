@@ -11,9 +11,10 @@ limit is visible on its own:
   raised out of the way. The first three calls succeed and the fourth
   is blocked — the run stops on count, not on cost.
 
-Denied calls are never charged, so the counters stay exactly where the
-budget stopped them. Costs come from the gateway's per-tool price table
-(files.list $0.00, files.read $0.01).
+Denied calls are charged once they pass the budget check — only calls
+blocked by the budget check itself are not charged, so the counters
+stay exactly where the budget stopped them. Costs come from the
+gateway's per-tool price table (files.list $0.00, files.read $0.01).
 
 Run from this directory:   python run.py
 Run from the repo root:    python examples/budget-limited-run/run.py
@@ -84,7 +85,7 @@ def main():
         failures.append(
             f"cost phase: expected 3 allowed then blocked, got {cost_results}")
     if cost_gateway.budgets.remaining()["cost_used"] != 0.03:
-        failures.append("cost phase: denied reads must not be charged")
+        failures.append("cost phase: budget-blocked reads must not be charged")
 
     print("\n=== Phase B. Call-count ceiling: max_calls 3, cost out of the way ===")
     count_gateway = _build(policy, {"max_calls": policy.budgets["max_calls"],
@@ -111,7 +112,8 @@ def main():
             print(f"  - {failure}")
         return 1
     print("\nPASS: run stopped at the $0.03 cost ceiling (phase A) and at "
-          "the 3-call ceiling (phase B); denied calls were not charged.")
+          "the 3-call ceiling (phase B); calls blocked by the budget "
+          "itself were not charged.")
     return 0
 
 

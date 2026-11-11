@@ -7,9 +7,10 @@ All examples are self-contained: they build a real `Gateway` over the
 local fake tools (`agentshield/tools.py` — a workspace-scoped file
 tool, a staging/production fake database, and deploy), run a scripted
 sequence of calls, and print `PASS` or `FAILED` at the end. Each one
-recreates its workspace and rewrites its own `audit.jsonl` on every
-run, so they are repeatable. Run them from the repository root, or
-from inside the example directory — both work.
+recreates its workspace on every run. The per-example `audit.jsonl`
+files are rewritten by the examples themselves; the main demo's audit
+log is append-only and is never truncated. Run them from the
+repository root, or from inside the example directory — both work.
 
 > **Note:** `docs/threat-model-notes.md` was deliberately not written.
 > The threat model lives in one place, [THREAT_MODEL.md](../THREAT_MODEL.md),
@@ -139,7 +140,9 @@ workspace holds five files, `a.txt`–`e.txt`.
   cannot interfere, five `files.read` calls are attempted. The first
   three succeed ($0.03 total) and the fourth and fifth are blocked.
   The run stops on cost, not on call count, and the budget state
-  shows `cost_used: 0.03` — denied reads were not charged.
+  shows `cost_used: 0.03` — the reads blocked by the budget itself
+  were not charged (every attempt that passes the budget check is
+  charged, even if policy or the tool then refuses it).
 - **Phase B — call-count ceiling:** with the cost ceiling raised to
   $10.00, five `files.list` calls are attempted. The first three
   succeed and the fourth and fifth are blocked. The run stops on
@@ -159,11 +162,13 @@ Every example writes its own `audit.jsonl` (one JSON object per
 line). An entry looks like this (fields may vary by run):
 
 ```json
-{"ts": "2026-11-11T10:00:00+00:00", "run_id": "run-1", "actor": "demo-agent",
+{"ts": "2026-11-11T10:00:00+00:00", "run_id": "run_9f2c1a7b4e5d6a01", "actor": "demo-agent",
  "tool": "db", "action": "query", "resource": "prod.users",
- "decision": "deny", "outcome": "denied by rule 'deny-db-prod'", "detail": ""}
+ "decision": "deny", "outcome": "denied by rule 'deny-db-prod'", "detail": "",
+ "prev_hash": "0000…", "hash": "a1b2…"}
 ```
 
+- `run_id` is unique per gateway run (`run_<16 hex>`), never a constant.
 - `decision` is `allow` or `deny`; `outcome` is the human-readable
   reason, naming the rule when one matched.
 - Denials are recorded too — a log with only successes cannot show
@@ -172,10 +177,12 @@ line). An entry looks like this (fields may vary by run):
   `[REDACTED:<NAME>]`, never in plaintext.
 - Check integrity with `AuditLog.verify()` (or by reading the
   `verify()` line each example prints): it confirms every line parses
-  as JSON and carries the required fields (`ts`, `actor`, `tool`,
-  `action`, `resource`, `decision`, `outcome`). It checks structure,
-  not authenticity — a local attacker with write access can edit the
-  file, as [THREAT_MODEL.md](../THREAT_MODEL.md) states.
+  as JSON, carries the required fields (`ts`, `run_id`, `actor`,
+  `tool`, `action`, `resource`, `decision`, `outcome`, `prev_hash`,
+  `hash`), and that the hash chain is intact — flipping, reordering,
+  or deleting a retained entry is detected. Deleting the tail of the
+  log or the whole file is not detectable from the file alone, as
+  [THREAT_MODEL.md](../THREAT_MODEL.md) states.
 
 ## Writing your own example
 

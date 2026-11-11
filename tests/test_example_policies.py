@@ -45,7 +45,7 @@ def assert_policies_equivalent(testcase, a, b):
 
 
 class PolicyFixture:
-    def setUp(self, policy_name):
+    def setUp(self, policy_name, user="dev", project="demo"):
         self.tmp = tempfile.TemporaryDirectory()
         self.workspace = os.path.join(self.tmp.name, "ws")
         os.makedirs(self.workspace)
@@ -55,7 +55,12 @@ class PolicyFixture:
         self.broker = SecretBroker(
             scopes=self.policy.secret_scopes,
             source={"AGENTSHIELD_SECRET_DB_PASSWORD": "test-secret-123"})
-        self.gateway = Gateway(
+        self.gateway = self._build_gateway(user=user, project=project)
+
+    def _build_gateway(self, user="dev", project="demo"):
+        # Identity is bound to the gateway session at construction;
+        # per-call user/project fields on ToolCall are ignored.
+        return Gateway(
             policy=self.policy,
             tools=FakeTools(self.workspace),
             broker=self.broker,
@@ -66,6 +71,8 @@ class PolicyFixture:
                 max_cost=self.policy.budgets.get("max_cost"))),
             audit=AuditLog(os.path.join(self.tmp.name, "audit.jsonl"),
                            redact=self.broker.redact),
+            user=user,
+            project=project,
         )
 
     def tearDown(self):
@@ -200,13 +207,23 @@ class TestTeamPolicy(unittest.TestCase, PolicyFixture):
             self.assertEqual(result["result"], "hello\n")
 
     def test_issues_scoped_to_team_alpha_project(self):
-        decision = self.gateway.explain(ToolCall(
-            "issues", "read", {"id": "1"}, project="team-alpha"))
+        # Project identity is bound to the gateway session, so each
+        # session below is built with its own project. A call claiming
+        # another project on its ToolCall fields is ignored.
+        alpha = self._build_gateway(project="team-alpha")
+        decision = alpha.explain(ToolCall("issues", "read", {"id": "1"},
+                                          project="team-alpha"))
         self.assertTrue(decision.allowed)
         self.assertIn("allow-issues-read-team-alpha", decision.reason)
-        decision = self.gateway.explain(ToolCall(
-            "issues", "read", {"id": "1"}, project="other-team"))
+        other = self._build_gateway(project="other-team")
+        decision = other.explain(ToolCall("issues", "read", {"id": "1"},
+                                          project="other-team"))
         self.assertFalse(decision.allowed)
+        # An agent in the team-alpha session cannot escape by claiming
+        # to be in another project, and vice versa: the session wins.
+        decision = alpha.explain(ToolCall("issues", "read", {"id": "1"},
+                                          project="other-team"))
+        self.assertTrue(decision.allowed)
 
 
 if __name__ == "__main__":

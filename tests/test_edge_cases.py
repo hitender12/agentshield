@@ -2,14 +2,6 @@
 expiry, budget boundaries, path-escape attempts, and YAML-subset limits.
 
 Run: python3 -m unittest discover -s tests
-
-Two tests in this file are marked ``expectedFailure`` on purpose. They
-document behaviour the spec requires but the reference core does not
-yet implement (approval expiry, symlink escape). They are *not* hidden
-passes: ``unittest`` reports them as expected failures, and each one
-names the core change needed. Do not "fix" them by weakening the
-assertion — fix the core module instead (outside tests/, so out of
-scope for this file).
 """
 
 import os
@@ -205,42 +197,68 @@ class TestApprovalExpiry(unittest.TestCase):
         self.assertFalse(store.is_approved("files", "delete", {"path": "notes.txt"}))
         self.assertEqual(store.list_pending(), [])
 
-    def test_approval_record_carries_no_expiry_yet(self):
-        """Documents a current gap (see the xfail test below).
-
-        ``ApprovalStore.request`` records no expiry timestamp and the
-        store takes no clock/TTL, so nothing in the record can ever make
-        an approval lapse. Delete this test and the xfail below when the
-        core gains approval expiry; both should be replaced by a test
-        that approves, advances the clock past the TTL, and is refused.
-        """
+    def test_approval_record_carries_expiry(self):
         store = ApprovalStore()
         token = store.request("files", "delete", {"path": "notes.txt"})
         record = store.pending(token)
-        self.assertNotIn("expires_at", record)
-        self.assertNotIn("ttl", record)
-        self.assertFalse(hasattr(store, "ttl"))
+        self.assertIn("expires_at", record)
+        self.assertEqual(record["ttl_seconds"], ApprovalStore().ttl_seconds)
+        self.assertEqual(store.ttl_seconds, 900)  # 15-minute default
 
-    @unittest.expectedFailure
     def test_expired_approval_must_be_refused(self):
-        """SPEC: an approval that has expired must be refused.
+        clock = FakeClock()
+        store = ApprovalStore(ttl_seconds=60, clock=clock)
+        token = store.request("files", "delete", {"path": "notes.txt"})
+        self.assertTrue(store.approve(token))
+        self.assertTrue(store.is_approved("files", "delete", {"path": "notes.txt"},
+                                           single_use=False))
+        clock.advance(61)
+        self.assertFalse(store.is_approved("files", "delete", {"path": "notes.txt"}))
 
-        Currently FAILS (expected): ApprovalStore has no TTL, no clock,
-        and no expiry field, so an approval granted at any time stays
-        valid indefinitely. The core fix is to give ApprovalStore a
-        TTL/clock (like BudgetManager's injectable clock) and have
-        ``is_approved`` return False once the approval has expired.
-        Until then this test records the requirement instead of
-        pretending the gateway enforces it.
-        """
+    def test_expired_approval_cannot_be_granted(self):
+        clock = FakeClock()
+        store = ApprovalStore(ttl_seconds=60, clock=clock)
+        token = store.request("files", "delete", {"path": "notes.txt"})
+        clock.advance(61)
+        self.assertFalse(store.approve(token))
+        self.assertFalse(store.is_approved("files", "delete", {"path": "notes.txt"}))
+
+    def test_consumed_approval_cannot_be_reapproved(self):
         store = ApprovalStore()
         token = store.request("files", "delete", {"path": "notes.txt"})
         self.assertTrue(store.approve(token))
-        # No expiry can be triggered through the current API, so the
-        # approval is still honoured — which is exactly the gap.
-        self.assertFalse(
-            store.is_approved("files", "delete", {"path": "notes.txt"}),
-            "expired approval was still honoured")
+        self.assertTrue(store.is_approved("files", "delete", {"path": "notes.txt"}))
+        # Consumed: re-approving the same token must fail.
+        self.assertFalse(store.approve(token))
+        self.assertFalse(store.is_approved("files", "delete", {"path": "notes.txt"}))
+
+    def test_deny_after_approve_revokes(self):
+        store = ApprovalStore()
+        token = store.request("files", "delete", {"path": "notes.txt"})
+        self.assertTrue(store.approve(token))
+        self.assertTrue(store.deny(token))
+        self.assertFalse(store.is_approved("files", "delete", {"path": "notes.txt"}))
+        self.assertFalse(store.approve(token))
+
+    def test_agent_cannot_approve_its_own_request(self):
+        store = ApprovalStore()
+        token = store.request("files", "delete", {"path": "notes.txt"}, actor="agent")
+        self.assertFalse(store.approve(token, actor="agent"))
+        self.assertTrue(store.approve(token, actor="human"))
+        record = store.pending(token)
+        self.assertEqual(record["actor"], "human")
+        self.assertEqual(record["approved_by"], "human")
+
+    def test_fresh_request_after_consumption_can_be_approved(self):
+        store = ApprovalStore()
+        call = ("files", "delete", {"path": "notes.txt"})
+        token = store.request(*call)
+        self.assertTrue(store.approve(token))
+        self.assertTrue(store.is_approved(*call))
+        # A new request for the same triple starts a new lifecycle.
+        token2 = store.request(*call)
+        self.assertTrue(store.approve(token2))
+        self.assertTrue(store.is_approved(*call))
 
 
 class TestBudgetEdges(unittest.TestCase):
@@ -450,11 +468,12 @@ class TestPathEscapes(unittest.TestCase):
             result = fixture.call("files", "read", {"path": "../secret.txt"})
             self.assertIsNone(result["result"])
             self.assertNotIn("SECRET", str(result))
-            # Policy allows the workspace/* glob, so the tool layer is
-            # what refuses: the gateway reports the tool error, not a
-            # successful read.
-            self.assertIn("error", result)
-            self.assertIn("escapes workspace", result["error"])
+            # The traversal is now refused by policy *before* the tool
+            # runs: the resource normalises to "secret.txt", which no
+            # workspace rule matches, so the gateway denies by default
+            # instead of letting the tool raise.
+            self.assertFalse(result["allowed"])
+            self.assertIn("default", result["reason"])
         finally:
             fixture.tearDown()
 
@@ -468,26 +487,16 @@ class TestPathEscapes(unittest.TestCase):
         finally:
             fixture.tearDown()
 
-    @unittest.expectedFailure
     def test_symlink_escape_is_blocked(self):
-        """SPEC: a symlink inside the workspace pointing outside it
-        must not let the file tools read outside files.
-
-        Currently FAILS (expected): ``FakeTools._safe_path`` uses
-        ``os.path.abspath`` (lexical normalisation) instead of
-        ``os.path.realpath`` (symlink resolution), so a symlink such as
-        ``ws/link.txt -> <outside>/secret.txt`` is followed and the
-        outside content is returned. The core fix is to resolve the
-        target with ``realpath`` and re-check containment, for files,
-        lists, and deletes alike. Until then this test records the
-        bypass instead of pretending the tools are symlink-safe.
+        """A symlink inside the workspace pointing outside it must not
+        let the file tools read outside files. ``FakeTools._safe_path``
+        resolves symlinks with ``realpath`` and re-checks containment.
         """
         link = os.path.join(self.workspace, "link.txt")
         os.symlink(self.outside, link)
         with self.assertRaises(ToolError):
             self.tools.files_read({"path": "link.txt"})
 
-    @unittest.expectedFailure
     def test_symlinked_directory_escape_is_blocked(self):
         """Same bypass via a symlinked directory (see test above)."""
         linkdir = os.path.join(self.workspace, "etclink")
@@ -559,17 +568,16 @@ class TestYamlSubsetLimits(unittest.TestCase):
         with self.assertRaises(PolicyError):
             Policy.from_yaml_subset("name: t\nrules: []\n")
 
-    def test_flow_style_value_is_not_a_list(self):
-        # A flow list as a rule value is NOT parsed as a list: it stays
-        # the literal string '[files, db]', which matches no tool. This
-        # documents the subset limit — use one rule per tool, or JSON.
-        policy = Policy.from_yaml_subset(
-            "name: t\nrules:\n  - id: x\n    effect: allow\n"
-            "    tool: [files, db]\n")
-        self.assertEqual(policy.rules[0].tool, "[files, db]")
-        engine = PolicyEngine(policy)
-        self.assertFalse(engine.evaluate(base_call(tool="files")).allowed)
-        self.assertFalse(engine.evaluate(base_call(tool="db")).allowed)
+    def test_flow_style_list_in_scalar_field_rejected(self):
+        # A flow list is now parsed as a list, and a rule field must be
+        # a string glob pattern — so a flow list in a scalar field is a
+        # clear PolicyError instead of a silent literal string that
+        # matches nothing. Flow lists belong in list-valued fields
+        # (e.g. secret_scopes), not in rule match fields.
+        with self.assertRaises(PolicyError):
+            Policy.from_yaml_subset(
+                "name: t\nrules:\n  - id: x\n    effect: allow\n"
+                "    tool: [files, db]\n")
 
     def test_nested_mapping_under_rule_rejected(self):
         with self.assertRaises(PolicyError):

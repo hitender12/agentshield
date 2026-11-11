@@ -46,10 +46,14 @@ rule that denies `files.delete` is.
 | `secret_scopes` | No | `{SECRET_NAME: [tool, ...]}` — which tools may receive each credential (see [Scoped secrets](#scoped-secrets)). |
 
 The loader (`agentshield/policy.py`, `Policy.from_dict`) rejects a
-policy with unknown rule fields, duplicate rule ids, or an effect
-other than `allow`/`deny`, raising `PolicyError`. It fails loudly on
-malformed input rather than guessing — validate with
+policy with unknown rule fields, duplicate rule ids, an effect
+other than `allow`/`deny`, a wrong type anywhere (a bare string where
+a list belongs, a list where a string glob belongs, a non-number
+budget), or duplicate keys in the YAML form, raising `PolicyError`.
+It fails loudly on malformed input rather than guessing — validate with
 `python -m agentshield check --policy <file>` before deploying a policy.
+A policy that fails to evaluate at runtime denies the call instead of
+crashing the gateway.
 
 ## Rules
 
@@ -97,9 +101,12 @@ Examples:
 Because `*` crosses `/`, `workspace/*` is broad — it covers nested
 directories too. If you need to confine reads to one directory level,
 there is no such pattern in this engine; say so in a review rather
-than assuming the glob is narrower than it is. The file tool itself
-also rejects paths escaping its base directory, as defence in depth
-(see `agentshield/tools.py`, `_safe_path`).
+than assuming the glob is narrower than it is. One thing `*` can no
+longer be abused for is traversal: the gateway normalises the
+resource before matching, so `workspace/../secret.txt` resolves to
+`secret.txt` and matches no workspace rule. The file tool itself
+also rejects paths escaping its base directory (resolving symlinks
+first), as defence in depth (see `agentshield/tools.py`, `_safe_path`).
 
 ### Resource namespacing
 
@@ -164,10 +171,11 @@ reason:  Denied by rule 'deny-db-prod'
   - deny rule matched: deny-db-prod [deny] tool=db, action=query, resource=prod.*, environment=prod
 ```
 
-`explain` runs the identical code path as `evaluate`, so the
-explanation cannot drift from the enforcement — and it never executes
-the call, writes an audit entry, or consumes budget (there is a test
-for that: `test_explain_mode_gives_correct_reason`). Use it every
+`explain` evaluates the full gate — budget, policy, and approval —
+exactly as `call` would, so the explanation cannot drift from the
+enforcement — and it never executes the call, writes an audit entry,
+or consumes budget or an approval (there is a test for that:
+`test_explain_mode_gives_correct_reason`). Use it every
 time you write or change a policy, before trusting it. Exit code 0
 means allowed, 1 means denied.
 
@@ -208,15 +216,22 @@ Notes:
   which is safe only because staging rules are the narrow ones. When
   you add a real tool, set the environment explicitly at the call
   site and test the prod case (the decision table does exactly this).
+- The environment a `db` or `deploy` call is evaluated against comes
+  from the call's *arguments* — the value the tool will actually
+  consume — and it must agree with the environment declared on the
+  call. A call that declares `staging` but passes `environment:
+  prod` in its arguments is denied outright, before policy is even
+  evaluated. Policy can never be checked on one environment while
+  the tool runs against another.
 
 ## Approvals
 
 `sensitive_actions` lists actions that need a human approval even
 when a policy rule allows them. The demo policy names `delete`,
 `run`, `send`, and `buy` — the irreversible or money-spending
-actions. The gateway check order is budget → policy → approval →
-secret → execute, so only a policy-allowed sensitive action ever
-reaches a human.
+actions. The gateway check order is environment agreement → budget →
+policy → approval → secret → execute, so only a policy-allowed
+sensitive action ever reaches a human.
 
 How approvals work (`agentshield/approval.py`):
 
@@ -225,14 +240,21 @@ How approvals work (`agentshield/approval.py`):
   canonical JSON of that triple.
 - A human approves the token after seeing the exact action and
   arguments. Rubber-stamping an approval without reading it protects
-  nothing (threat-model assumption 5).
+  nothing (threat-model assumption 5). Only a human may approve:
+  the gateway exposes no approve method, so the agent cannot approve
+  its own calls, and `approve()` refuses `actor="agent"`.
 - At execution time the gateway recomputes the token from the
   **actual** call. Different arguments produce a different token, so
   an approval for `files.delete notes.txt` does not cover
   `files.delete other.txt`, and an approval for deploying service
   `web` does not cover deploying service `api`.
 - Approvals are **single-use**: once the approved call has run, the
-  same approval cannot be used again.
+  same approval cannot be used again — and a consumed approval can
+  never be re-approved (replay is refused).
+- Approvals **expire** (15-minute default, configurable per store).
+  An expired approval is refused, and cannot be granted late.
+- **Denying revokes**: `deny()` on a granted approval removes it, so
+  a human who changes their mind actually stops the call.
 
 Policy consequences:
 
@@ -256,7 +278,7 @@ Policy consequences:
 
 | Key | Meaning |
 | --- | ------- |
-| `max_calls` | Maximum number of executed tool calls in the run. |
+| `max_calls` | Maximum number of attempted tool calls in the run. |
 | `max_seconds` | Maximum wall-clock seconds since the run started. |
 | `max_cost` | Maximum total cost, in the currency of the per-tool price table (`TOOL_COSTS` in `agentshield/tools.py`: `files.list` $0.00, `files.read` $0.01, `files.delete` $0.05, `db.query` $0.02, `deploy.run` $0.50). |
 
@@ -265,9 +287,11 @@ Rules of the budget system (`agentshield/budget.py`):
 - **Exceeding any budget blocks everything**, and the block
   **latches** — once blocked, later calls stay blocked for the rest
   of the run.
-- **Only executed calls are charged.** A call denied by policy or
-  refused for lack of approval is never charged, so a run that hits
-  its budget stopped on real work, not on denials.
+- **Every attempted call is charged.** Once a call passes the budget
+  check, its cost and count are recorded immediately — whether policy,
+  approval, or the tool itself then refuses it. Denied and erroring
+  calls cannot loop for free. (Calls blocked by the budget check
+  itself are not charged: the check fails before anything is recorded.)
 - Omit a key to leave that dimension uncapped. All three omitted
   means no budget at all — do not do that for an agent you do not
   fully trust.
@@ -298,11 +322,13 @@ Rules:
 - **Never put a secret in a policy file.** Policy files are reviewed,
   versioned, and shared; a credential in one must be treated as
   compromised.
-- Every value the broker has handed out is registered for redaction,
-  so the audit writer scrubs it from recorded text as
-  `[REDACTED:<NAME>]`. A secret the broker never handed out is not
-  redacted — another reason to route every credential through the
-  broker.
+- Every configured secret is registered for redaction at broker
+  construction — fetched or not, any length — so the audit writer
+  scrubs it from recorded text as `[REDACTED:<NAME>]`, including a
+  secret that only appears inside a file path or a tool's output.
+- A secret with **no scope entry is handed to no tool**. Access must
+  be granted explicitly in `secret_scopes`; omission is a denial,
+  never a default allow.
 - Scoping is not secrecy from nothing: if the host or user account is
   compromised, the environment can be read directly (threat-model
   assumption 4). The broker limits *which tool* sees a credential,
@@ -320,8 +346,11 @@ The subset (documented in the module docstring of
 - `key: value` pairs (strings, ints, floats, booleans, null)
 - nested mappings by indentation (spaces only — **tabs are rejected**)
 - lists with `- item` and `- key: value` (list of maps)
+- flow collections: `[a, b]` and `{k: v}`
 - `#` full-line comments and ` #` trailing comments outside quotes
 - single- and double-quoted strings
+- duplicate mapping keys are **rejected** (last-win would silently
+  change the policy)
 
 It is **not** a full YAML parser. Anything outside the subset raises
 `PolicyError` instead of being misinterpreted. The two example
@@ -432,10 +461,12 @@ operator read a shared dataset while everyone else is denied:
  "user": "analyst", "project": "quarterly-review"}
 ```
 
-Omit `user`/`project` unless you actually need them — the gateway's
-`ToolCall` defaults are `user="dev"`, `project="demo"`, and a rule
-that matches on a user nobody sets will silently never match. Test
-with `explain` using the real actor values.
+Omit `user`/`project` unless you actually need them — identity is
+bound to the gateway session at construction (`Gateway(..., user=...,
+project=...)`), and the same fields on a `ToolCall` are
+caller-controlled and ignored. A rule that matches on a user or
+project no session is bound to will silently never match. Test with
+`explain` using the real session identity.
 
 ## Common mistakes
 
@@ -451,7 +482,9 @@ with `explain` using the real actor values.
    `resource: notes.txt` matches nothing.
 4. **Assuming `*` stops at `/`.** It does not — `workspace/*`
    matches nested paths. The file tool's path-escape check is the
-   second line of defence, not the policy.
+   second line of defence, not the policy. (Traversal itself is
+   handled: the gateway normalises `..` segments before matching, so
+   a traversal cannot exploit the crossing `*`.)
 5. **Putting a secret in the policy.** Secrets live in the
    environment and are scoped via `secret_scopes`. Never in JSON/YAML.
 6. **Trusting the policy without running `explain`.** A policy that

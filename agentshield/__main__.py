@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 from .approval import ApprovalStore
 from .audit import AuditLog
@@ -21,6 +22,13 @@ from .gateway import Gateway, ToolCall
 from .policy import Policy, PolicyError
 from .secrets import SecretBroker
 from .tools import FakeTools
+
+# All CLI defaults resolve against the repository root, so the CLI works
+# from any working directory — not just from a checkout's root.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_POLICY = str(REPO_ROOT / "policies" / "examples" / "demo-policy.json")
+DEFAULT_WORKSPACE = str(REPO_ROOT / "demo-workspace")
+DEFAULT_AUDIT = str(REPO_ROOT / "audit.jsonl")
 
 
 def load_policy(path):
@@ -48,7 +56,7 @@ def build_gateway(policy, workspace, audit_path):
 
 
 def cmd_demo(args):
-    from demo import run_demo
+    from .demo import run_demo
     run_demo(args.policy, args.workspace, args.audit)
     return 0
 
@@ -86,9 +94,9 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("demo", help="run the scripted demo gateway")
-    p.add_argument("--policy", default="policies/examples/demo-policy.json")
-    p.add_argument("--workspace", default="demo-workspace")
-    p.add_argument("--audit", default="audit.jsonl")
+    p.add_argument("--policy", default=DEFAULT_POLICY)
+    p.add_argument("--workspace", default=DEFAULT_WORKSPACE)
+    p.add_argument("--audit", default=DEFAULT_AUDIT)
     p.set_defaults(func=cmd_demo)
 
     p = sub.add_parser("explain", help="explain a call without executing it")
@@ -97,8 +105,8 @@ def main(argv=None):
     p.add_argument("--action", required=True)
     p.add_argument("--resource", default="")
     p.add_argument("--environment", default="staging")
-    p.add_argument("--workspace", default="demo-workspace")
-    p.add_argument("--audit", default="audit.jsonl")
+    p.add_argument("--workspace", default=DEFAULT_WORKSPACE)
+    p.add_argument("--audit", default=DEFAULT_AUDIT)
     p.set_defaults(func=cmd_explain)
 
     p = sub.add_parser("check", help="validate a policy file")

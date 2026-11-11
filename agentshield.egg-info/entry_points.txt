@@ -1,0 +1,2 @@
+[console_scripts]
+agentshield = agentshield.__main__:main

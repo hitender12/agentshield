@@ -37,21 +37,19 @@ python -m unittest discover -s tests
 ```
 
 All tests must pass before a pull request is considered ready
-(`python -m unittest discover -s tests` — 85 tests at v0.1.0: 29 core
-tests in `test_agentshield.py`, 43 edge-case tests in
+(`python -m unittest discover -s tests` — 145 tests at v0.1.1: 29 core
+tests in `test_agentshield.py`, 48 edge-case tests in
 `test_edge_cases.py`, 13 example-policy tests in
-`test_example_policies.py`). The suite covers policy loading (JSON and
-the YAML subset), the 9-case policy decision table, deny-wins, approval
-binding and single-use, budget call/cost/time enforcement, secret
-scoping and audit redaction, and explain-mode correctness. Run the
-tests from the repository root; the test modules insert the repo root
-on `sys.path` themselves.
-
-Note: 3 of the 85 are marked `expectedFailure` on purpose. They
-document behaviour the spec requires but the reference core does not
-yet implement (approval expiry, and symlink escape from the
-workspace). They are not hidden passes — do not "fix" them by
-weakening the assertion; fix the core module instead.
+`test_example_policies.py`, and 55 security-regression tests in
+`test_security_fixes.py`, including seeded fuzz tests over random
+policies and calls). The suite covers policy loading (JSON and
+the YAML subset), the 25-case policy decision table, deny-wins,
+approval binding, single-use, expiry, revocation and human-only
+approval, budget call/cost/time enforcement with per-attempt charging,
+secret scoping and audit redaction, hash-chain tamper detection,
+environment-mismatch rejection, symlink-escape blocking, and
+explain-mode correctness. Run the tests from the repository root;
+the test modules insert the repo root on `sys.path` themselves.
 
 ## Running the demo
 
@@ -69,7 +67,8 @@ python -m agentshield demo        # same demo via the CLI
 
 The demo is self-contained: it sets a demo-only secret in-process
 (`s3cr3t-db-password-123`), recreates `demo-workspace/notes.txt` and
-`data.txt` on each run, and rewrites `audit.jsonl`. It prints a
+`data.txt` on each run, and appends to `audit.jsonl` (the audit log is
+append-only and is never truncated). It prints a
 redaction check at the end — the demo secret must **not** appear in
 the audit file. Never point the demo at a real workspace or a real
 secret; use `AGENTSHIELD_SECRET_<NAME>` environment variables for real
@@ -89,8 +88,9 @@ python -m agentshield explain --policy policies/examples/demo-policy.json \
 ```
 
 `explain` must never execute the call, write an audit entry, or consume
-budget. If a change makes it do any of those, it is a bug — see the
-test `test_explain_mode_gives_correct_reason` in `tests/test_agentshield.py`.
+budget or an approval. If a change makes it do any of those, it is a
+bug — see the test `test_explain_mode_gives_correct_reason` in
+`tests/test_agentshield.py`.
 
 ## How to write a policy
 
@@ -113,11 +113,12 @@ small documented YAML subset. The full guide is
 - Sensitive actions (`delete`, `run`, `send`, `buy` in the demo policy)
   need a human approval bound to the exact arguments, even when a rule
   allows them. Changing the arguments invalidates the approval, and
-  approvals are single-use.
+  approvals are single-use, expire (15-minute default), and can only
+  be granted by a human — the gateway exposes no approve method.
 - Budgets (`max_calls`, `max_seconds`, `max_cost`) cap a run. Once a
   budget is exceeded the block latches — later calls stay blocked.
-  Only executed calls are charged; denied or unapproved calls cost
-  nothing.
+  Every attempted call is charged once it passes the budget check;
+  denied or erroring calls cost the same as successful ones.
 
 JSON example (from `policies/examples/demo-policy.json`):
 
@@ -143,7 +144,8 @@ The YAML subset is documented in the module docstring of
 `agentshield/policy.py` and demonstrated in
 `policies/examples/demo-policy.yaml`. It supports `key: value` pairs,
 nested mappings by indentation, `- item` and `- key: value` lists,
-and `#` comments. It is **not** a full YAML parser: tabs are rejected,
+flow collections (`[a, b]`, `{k: v}`), and `#` comments. It is **not**
+a full YAML parser: tabs are rejected, duplicate keys are rejected,
 and anything outside the subset raises `PolicyError` instead of being
 silently misinterpreted. Use JSON for complex policies, and never
 "extend" the subset parser without tests proving malformed input is

@@ -14,12 +14,12 @@ deleting files, deploying, or spending money without approval.
 
 | Asset | Protected by |
 |---|---|
-| Production data (prod DB) | Policy deny rules (`deny-db-prod`); secret scoping (DB credential only handed to the `db` tool, only for allowed calls) |
-| Files outside the workspace | Policy resource globs + the file tool's own path-escape check (defense in depth) |
-| Irreversible actions (delete/deploy/send/buy) | Human approval bound to exact arguments; single-use |
-| Runaway cost / tool-call loops | Call, time, and cost budgets (blocks latch) |
-| Secrets in logs | Broker redaction before audit writes |
-| Accountability | Append-only audit log with actor, decision, resource, outcome |
+| Production data (prod DB) | Policy deny rules (`deny-db-prod`); secret scoping (DB credential only handed to the `db` tool, only for allowed calls); environment agreement — the environment and resource are derived from the arguments the tool will consume, and a call whose declared environment disagrees with its arguments is denied before policy is even evaluated |
+| Files outside the workspace | Policy resource globs on normalised resources (`workspace/../x` resolves to `x` and matches no workspace rule) + the file tool's own `realpath` symlink/containment check (defense in depth) |
+| Irreversible actions (delete/deploy/send/buy) | Human approval bound to exact arguments; single-use with no replay (consumed tokens can never be re-approved); deny revokes; 15-minute expiry; only a human may grant an approval — the gateway exposes no approve method |
+| Runaway cost / tool-call loops | Call, time, and cost budgets (blocks latch); every attempted call is charged once it passes the budget check, so denied and erroring calls cannot loop for free |
+| Secrets in logs | Broker redaction before audit writes — every configured secret is registered at startup, any length, and unscoped secrets are denied by default |
+| Accountability | Append-only, hash-chained audit log with actor, decision, resource, outcome; `verify()` detects flipped, reordered, or deleted retained entries |
 
 ## Assumptions (the gateway's security depends on these)
 
@@ -38,6 +38,12 @@ deleting files, deploying, or spending money without approval.
 5. **The human approver actually reads the approval.** An approval that is
    rubber-stamped protects nothing. Approvals show the exact action and
    arguments for this reason.
+6. **Identity is bound to the gateway session.** `user`/`project` are set
+   when the gateway is constructed; the same fields on a `ToolCall` are
+   caller-controlled and are ignored for policy evaluation. If the
+   session is created with the wrong identity, user/project rules
+   enforce the wrong identity — the operator, not the agent, is
+   responsible for binding the session to the right principal.
 
 ## What this does NOT protect against
 
@@ -54,9 +60,11 @@ deleting files, deploying, or spending money without approval.
 - **Side channels and resource exhaustion outside the gateway** (CPU, disk,
   network from the tool itself). Budgets cap gateway-routed calls only.
 - **Audit log tampering by a local attacker.** The log is append-only by
-  convention in this implementation, not by cryptographic chaining or
-  remote storage. A local attacker with write access can edit it. Tamper
-  evidence (hash chaining, remote shipping) is a later milestone.
+  convention in this implementation, with hash chaining as tamper
+  evidence: flipping, reordering, or deleting a *retained* entry breaks
+  the chain and is detected by `verify()`. Deleting the *tail* of the
+  log, or the whole file, still cannot be detected from the file alone.
+  Tamper *proof* (signatures, remote shipping) is a later milestone.
 - **Timing and concurrency attacks.** This reference implementation is
   single-process and in-memory; it has no locking, no rate limiting
   beyond budgets, and no protection against concurrent policy reloads.
@@ -65,12 +73,16 @@ deleting files, deploying, or spending money without approval.
 
 - No real MCP transport; demo tools are local fakes.
 - Policy and approvals live in memory; restarting loses pending approvals.
-- The YAML reader is a documented subset, not full YAML — malformed input
-  outside the subset raises an error rather than being misinterpreted.
-- Audit `verify()` checks structure, not authenticity (no signatures).
+- The YAML reader is a documented subset, not full YAML — it parses flow
+  collections and rejects duplicate keys, but malformed input outside
+  the subset raises an error rather than being misinterpreted.
+- Audit `verify()` checks structure and the hash chain, not signatures.
+  Tail deletion is undetectable from the file alone.
 - Cost accounting uses static per-tool prices, not measured spend.
-- No automated tests for adversarial policy files (fuzz tests are a
-  milestone, M6 in the blueprint).
+- Seeded fuzz tests over random policies and calls exist
+  (`tests/test_security_fixes.py`); they assert the gateway never
+  raises and deny-by-default always holds, but they are not a
+  penetration test.
 
 ## Security status
 

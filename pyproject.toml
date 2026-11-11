@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentshield"
-version = "0.1.0"
+version = "0.1.1"
 description = "One auditable permission and policy layer in front of AI tools and MCP servers."
 readme = "README.md"
 license = { text = "MIT" }

@@ -6,6 +6,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 once it leaves 0.x. Until then, minor-version bumps may include breaking
 changes to the policy format or CLI, and those will be called out here.
 
+## [0.1.1] — 2026-11-11
+
+Security-fix release: an independent QA audit found 16 real
+vulnerabilities and gaps; all 16 are fixed here, each with a
+regression test in `tests/test_security_fixes.py` (the suite grows
+85 → 145 tests). The three `expectedFailure` tests from 0.1.0 now
+pass as normal tests. **The package is still a reference
+implementation, not production-secure** — see
+[THREAT_MODEL.md](THREAT_MODEL.md).
+
+### Fixed
+
+- **Environment confusion (most serious).** The gateway checked
+  policy on the call's declared environment while the tool executed
+  against the environment in its arguments, so a `staging` call
+  carrying `prod` arguments returned full production data. The
+  environment and resource are now derived from the arguments the
+  tool will consume, and a declared/argument mismatch is denied
+  outright before anything is evaluated.
+- **Symlink escape.** `_safe_path` used lexical `abspath`; a symlink
+  inside the workspace pointing outside it was followed. It now uses
+  `realpath` and re-checks containment on the resolved path. File
+  resources are also normalised before policy matching, so
+  `workspace/../secret.txt` resolves to `secret.txt` and matches no
+  workspace rule.
+- **Approvals.** Approvals now expire (15-minute default, configurable,
+  injectable clock), are single-use with no replay (a consumed token
+  can never be re-approved), `deny()` revokes a granted approval, and
+  only a human may grant one (`approve()` refuses `actor="agent"`;
+  the gateway exposes no approve method at all). Granted approvals
+  record `actor="human"`.
+- **Redaction gaps.** Every configured secret is registered for
+  redaction at broker construction — fetched or not, any length (the
+  <4-character exemption is gone) — and a secret with no
+  `secret_scopes` entry is handed to no tool (default deny).
+- **Budgets.** Every attempted call is charged once it passes the
+  budget check; denied and erroring calls can no longer loop for free.
+- **YAML misparses.** The YAML-subset parser now parses flow
+  collections (`[a, b]`, `{k: v}`) instead of leaving them as strings
+  that `list()` would explode into characters, and duplicate mapping
+  keys are rejected with a clear error.
+- **Audit verify.** `verify()` no longer crashes on a corrupt line —
+  it reports it and keeps checking. Entries are hash-chained, so
+  flipping, reordering, or deleting a retained entry is detected.
+  (Deleting the tail or the whole file is still undetectable from the
+  file alone.)
+- **Policy type validation.** `Policy.from_dict` / `Rule.from_dict`
+  strictly validate types: a bare string for `sensitive_actions` or
+  a `secret_scopes` value, a list where a string glob belongs, or a
+  non-number budget is now a clear `PolicyError` instead of silently
+  disabling a control. A policy that fails to evaluate denies the
+  call instead of crashing the gateway.
+- **Explain mode.** `Gateway.explain` now evaluates the full gate
+  (budget probe, policy, approval peek) instead of policy alone, so
+  it no longer reports ALLOWED for an unapproved delete or a
+  budget-exhausted call — and still consumes nothing.
+- **Console script.** The demo moved into the package
+  (`agentshield/demo.py`); `agentshield demo` works as an installed
+  console script, and CLI paths default to the repository root, so
+  the CLI works from any working directory.
+- **`.gitignore`** now covers `*.egg-info/` and `build/`.
+- **Session identity.** `user`/`project` are bound to the gateway
+  session at construction; per-call identity fields are
+  caller-controlled and ignored for policy evaluation.
+- **Run ids** are unique per audit log (`run_<16 hex>`) instead of
+  the constant `run-1`.
+- **Demo** no longer deletes `audit.jsonl` at start (append-only is
+  honoured).
+- **Fuzz tests** added: seeded random policies and calls assert the
+  gateway never raises and deny-by-default always holds.
+
+### Changed
+
+- `BudgetManager` gains `would_allow()` (non-latching budget probe
+  for explain mode). `ApprovalStore` gains a TTL/clock, `has_approval()`
+  (non-consuming peek), and consumed/denied token sets. `AuditLog`
+  gains hash-chained entries and a tolerant `verify()`. `Gateway`
+  gains session identity (`user`, `project`) and the environment
+  agreement check. `SecretBroker` denies unscoped secrets by default.
+- The budget example and policy guide now state the per-attempt
+  charging rule correctly. README, THREAT_MODEL.md, ARCHITECTURE.md,
+  and docs were updated to match the fixed code.
+
 ## [0.1.0] — 2026-11-11
 
 Initial release: a Python 3.10+ standard-library-only reference
