@@ -1,0 +1,56 @@
+# Demo policy in the YAML subset (see agentshield/policy.py for the subset).
+# Equivalent to demo-policy.json.
+name: demo
+version: 1
+sensitive_actions:
+  - delete
+  - run
+  - send
+  - buy
+budgets:
+  max_calls: 50
+  max_seconds: 300
+  max_cost: 5.0
+secret_scopes:
+  DB_PASSWORD:
+    - db
+rules:
+  - id: allow-files-in-workspace
+    effect: allow
+    tool: files
+    action: list
+    resource: workspace/*
+  - id: allow-read-workspace
+    effect: allow
+    tool: files
+    action: read
+    resource: workspace/*
+  - id: allow-delete-workspace
+    effect: allow
+    tool: files
+    action: delete
+    resource: workspace/*
+  - id: allow-db-staging
+    effect: allow
+    tool: db
+    action: query
+    resource: staging.*
+    environment: staging
+  - id: deny-db-prod
+    effect: deny
+    tool: db
+    action: query
+    resource: prod.*
+    environment: prod
+  - id: allow-deploy-staging
+    effect: allow
+    tool: deploy
+    action: run
+    resource: staging
+    environment: staging
+  - id: deny-deploy-prod
+    effect: deny
+    tool: deploy
+    action: run
+    resource: prod
+    environment: prod

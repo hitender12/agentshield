@@ -1,0 +1,75 @@
+{
+  "budgets": {
+    "max_calls": 50,
+    "max_cost": 5.0,
+    "max_seconds": 300
+  },
+  "name": "demo",
+  "rules": [
+    {
+      "action": "list",
+      "effect": "allow",
+      "id": "allow-files-in-workspace",
+      "resource": "workspace/*",
+      "tool": "files"
+    },
+    {
+      "action": "read",
+      "effect": "allow",
+      "id": "allow-read-workspace",
+      "resource": "workspace/*",
+      "tool": "files"
+    },
+    {
+      "action": "delete",
+      "effect": "allow",
+      "id": "allow-delete-workspace",
+      "resource": "workspace/*",
+      "tool": "files"
+    },
+    {
+      "action": "query",
+      "effect": "allow",
+      "environment": "staging",
+      "id": "allow-db-staging",
+      "resource": "staging.*",
+      "tool": "db"
+    },
+    {
+      "action": "query",
+      "effect": "deny",
+      "environment": "prod",
+      "id": "deny-db-prod",
+      "resource": "prod.*",
+      "tool": "db"
+    },
+    {
+      "action": "run",
+      "effect": "allow",
+      "environment": "staging",
+      "id": "allow-deploy-staging",
+      "resource": "staging",
+      "tool": "deploy"
+    },
+    {
+      "action": "run",
+      "effect": "deny",
+      "environment": "prod",
+      "id": "deny-deploy-prod",
+      "resource": "prod",
+      "tool": "deploy"
+    }
+  ],
+  "secret_scopes": {
+    "DB_PASSWORD": [
+      "db"
+    ]
+  },
+  "sensitive_actions": [
+    "delete",
+    "run",
+    "send",
+    "buy"
+  ],
+  "version": 1
+}
