@@ -35,6 +35,9 @@ class FakeTools:
 
     # -- path safety: a tool may only touch paths inside base_dir --------
     def _safe_path(self, rel):
+        if not isinstance(rel, str):
+            raise ToolError(
+                f"path must be a string, got {type(rel).__name__}")
         # realpath (not abspath) resolves every symlink component, so a
         # symlink inside the workspace that points outside it is caught
         # here instead of being followed into the outside file. The
@@ -46,22 +49,35 @@ class FakeTools:
 
     def files_list(self, args):
         path = self._safe_path(args.get("path", "."))
-        if not os.path.isdir(path):
-            raise ToolError(f"not a directory: {args.get('path')!r}")
-        return sorted(os.listdir(path))
+        try:
+            if not os.path.isdir(path):
+                raise ToolError(f"not a directory: {args.get('path')!r}")
+            return sorted(os.listdir(path))
+        except OSError as exc:
+            raise ToolError(f"cannot list {args.get('path')!r}: {exc}") from exc
 
     def files_read(self, args):
         path = self._safe_path(args.get("path", ""))
         if not os.path.isfile(path):
             raise ToolError(f"not a file: {args.get('path')!r}")
-        with open(path, encoding="utf-8") as fh:
-            return fh.read()
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read()
+        except UnicodeDecodeError:
+            # A binary file must be a ToolError (denied/errored by the
+            # gateway), never an uncaught decode crash.
+            raise ToolError(f"not valid UTF-8 text: {args.get('path')!r}")
+        except OSError as exc:
+            raise ToolError(f"cannot read {args.get('path')!r}: {exc}") from exc
 
     def files_delete(self, args):
         path = self._safe_path(args.get("path", ""))
         if not os.path.isfile(path):
             raise ToolError(f"not a file: {args.get('path')!r}")
-        os.remove(path)
+        try:
+            os.remove(path)
+        except OSError as exc:
+            raise ToolError(f"cannot delete {args.get('path')!r}: {exc}") from exc
         return f"deleted {args.get('path')}"
 
     def deploy_run(self, args):
@@ -71,15 +87,25 @@ class FakeTools:
     def db_query(self, args, secret=None):
         env = args.get("environment", "")
         table = args.get("table", "")
+        if not isinstance(env, str) or not isinstance(table, str):
+            raise ToolError("db query needs string environment and table")
         data = self.db.get(env, {})
         if table not in data:
             raise ToolError(f"no table {table!r} in {env!r}")
         # `secret` is accepted (a scoped DB credential) but never logged
         # or echoed back; it only proves the broker handed it to this call.
+        # It does NOT gate data access: rows are returned with
+        # authenticated False when no credential was configured (see
+        # THREAT_MODEL.md). Real deployments must enforce authentication
+        # in the tool/MCP server itself.
         return {"environment": env, "table": table, "rows": data[table],
                 "authenticated": secret is not None}
 
     def dispatch(self, tool, action, args, secret=None):
+        if not isinstance(tool, str) or not isinstance(action, str):
+            raise ToolError("tool and action must be strings")
+        if not isinstance(args, dict):
+            raise ToolError("args must be a mapping")
         handlers = {
             ("files", "list"): lambda: self.files_list(args),
             ("files", "read"): lambda: self.files_read(args),

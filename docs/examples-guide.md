@@ -180,9 +180,10 @@ line). An entry looks like this (fields may vary by run):
   as JSON, carries the required fields (`ts`, `run_id`, `actor`,
   `tool`, `action`, `resource`, `decision`, `outcome`, `prev_hash`,
   `hash`), and that the hash chain is intact — flipping, reordering,
-  or deleting a retained entry is detected. Deleting the tail of the
-  log or the whole file is not detectable from the file alone, as
-  [THREAT_MODEL.md](../THREAT_MODEL.md) states.
+  or deleting a retained entry is detected, except a tail rewrite in
+  which the attacker also recomputes the affected hashes. Deleting
+  the tail of the log or the whole file is not detectable from the
+  file alone, as [THREAT_MODEL.md](../THREAT_MODEL.md) states.
 
 ## Writing your own example
 

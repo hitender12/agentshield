@@ -2,8 +2,10 @@
 ceiling. Exceeding any of them blocks further calls.
 
 Costs are charged per *attempted* call: once the budget check passes,
-the attempt is recorded immediately, whether policy, approval, or the
-tool itself then refuses it. Denied and erroring calls cannot loop for
+the attempt is recorded immediately, whether environment agreement,
+policy, approval, or the tool itself then refuses it. The gateway runs
+the budget gate *first*, so environment-mismatched and malformed calls
+cannot loop for free either. Denied and erroring calls cannot loop for
 free. The clock is injectable so tests can simulate time passing
 deterministically.
 """

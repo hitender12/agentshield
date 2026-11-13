@@ -37,19 +37,25 @@ python -m unittest discover -s tests
 ```
 
 All tests must pass before a pull request is considered ready
-(`python -m unittest discover -s tests` — 145 tests at v0.1.1: 29 core
+(`python -m unittest discover -s tests` — 183 tests at v0.1.2: 29 core
 tests in `test_agentshield.py`, 48 edge-case tests in
 `test_edge_cases.py`, 13 example-policy tests in
-`test_example_policies.py`, and 55 security-regression tests in
-`test_security_fixes.py`, including seeded fuzz tests over random
-policies and calls). The suite covers policy loading (JSON and
+`test_example_policies.py`, 55 security-regression tests in
+`test_security_fixes.py`, and 38 round-2 regression tests in
+`test_round2_fixes.py`, including seeded fuzz tests over random
+policies and calls, plus 200 malformed-argument trials asserting the
+gateway never raises). The suite covers policy loading (JSON and
 the YAML subset), the 25-case policy decision table, deny-wins,
 approval binding, single-use, expiry, revocation and human-only
-approval, budget call/cost/time enforcement with per-attempt charging,
-secret scoping and audit redaction, hash-chain tamper detection,
-environment-mismatch rejection, symlink-escape blocking, and
-explain-mode correctness. Run the tests from the repository root;
-the test modules insert the repo root on `sys.path` themselves.
+approval, budget call/cost/time enforcement with per-attempt charging
+(including environment-mismatched and malformed calls), secret
+scoping and audit redaction (all free-text fields), hash-chain tamper
+detection (including the flip-after-corrupt-line case),
+environment-mismatch rejection, symlink-escape blocking, YAML
+anchor/alias/tag and depth-limit rejection, type-distinct approval
+tokens, and explain-mode correctness. Run the tests from the
+repository root; the test modules insert the repo root on `sys.path`
+themselves.
 
 ## Running the demo
 
@@ -117,8 +123,11 @@ small documented YAML subset. The full guide is
   be granted by a human — the gateway exposes no approve method.
 - Budgets (`max_calls`, `max_seconds`, `max_cost`) cap a run. Once a
   budget is exceeded the block latches — later calls stay blocked.
-  Every attempted call is charged once it passes the budget check;
-  denied or erroring calls cost the same as successful ones.
+  The budget gate runs first, so every attempted call is charged,
+  including environment-mismatched and malformed calls; denied or
+  erroring calls cost the same as successful ones. (Calls blocked by
+  the budget check itself are not charged: the check fails before
+  anything is recorded.)
 
 JSON example (from `policies/examples/demo-policy.json`):
 
@@ -146,10 +155,11 @@ The YAML subset is documented in the module docstring of
 nested mappings by indentation, `- item` and `- key: value` lists,
 flow collections (`[a, b]`, `{k: v}`), and `#` comments. It is **not**
 a full YAML parser: tabs are rejected, duplicate keys are rejected,
-and anything outside the subset raises `PolicyError` instead of being
-silently misinterpreted. Use JSON for complex policies, and never
-"extend" the subset parser without tests proving malformed input is
-still rejected.
+anchors/aliases/tags/block scalars/document markers and nesting
+beyond 32 levels are rejected, and anything outside the subset raises
+`PolicyError` instead of being silently misinterpreted. Use JSON for
+complex policies, and never "extend" the subset parser without tests
+proving malformed input is still rejected.
 
 Validate any policy you write or change:
 

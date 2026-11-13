@@ -11,17 +11,26 @@ Security properties enforced here (each has a regression test):
 
 - **Single-use, no replay.** Consuming an approval moves its token to a
   ``_consumed`` set. ``approve()`` on a consumed token returns False, so
-  a consumed approval can never be re-added.
+  a consumed approval *token* can never be re-added or replayed. A
+  *fresh* request for the same (tool, action, args) triple starts a new
+  approval lifecycle, and a human may grant that new request — the
+  property that holds is about the token instance, not the triple.
 - **Deny revokes.** ``deny()`` removes a granted approval as well as
   refusing a pending one; a denied token can never be used.
 - **Expiry.** Approvals carry a TTL (default 15 minutes) against an
   injectable clock. Expired approvals are refused by ``is_approved`` and
-  cannot be granted by ``approve()``.
+  cannot be granted by ``approve()``. The TTL must be a positive number;
+  ``None`` (no expiry) is rejected at construction.
 - **Human-only approval.** The agent *requests* an approval (the request
   records the agent as requester); only a human may *grant* it. The
   gateway exposes no approve method at all — ``approve()`` is the
   out-of-band human step (CLI prompt, web UI, chat confirmation), and it
   refuses ``actor="agent"``. A granted approval records ``actor="human"``.
+- **Type-distinct tokens.** The approval token is a SHA-256 over a
+  type-tagged canonical form of the (tool, action, args) triple, so a
+  list and a tuple with the same items are *different* tokens.
+  Argument values must be JSON values; anything else raises TypeError
+  (the gateway denies such calls instead of approving them).
 """
 
 from __future__ import annotations
@@ -37,23 +46,63 @@ from datetime import datetime, timedelta, timezone
 DEFAULT_TTL_SECONDS = 900
 
 
+def _canonical(value):
+    """Type-tagged canonical form of a JSON-like value.
+
+    Every value carries its type, so a list and a tuple with the same
+    items encode differently, and an int key ``1`` differs from the
+    string key ``"1"``. Anything that is not a JSON value (set, bytes,
+    arbitrary object) raises TypeError — the gateway denies such calls
+    instead of approving them.
+    """
+    if value is None:
+        return ["null"]
+    if isinstance(value, bool):
+        return ["bool", value]
+    if isinstance(value, str):
+        return ["str", value]
+    if isinstance(value, int):
+        return ["int", value]
+    if isinstance(value, float):
+        return ["float", repr(value)]
+    if isinstance(value, (list, tuple)):
+        tag = "list" if isinstance(value, list) else "tuple"
+        return [tag, [_canonical(item) for item in value]]
+    if isinstance(value, dict):
+        items = [[_canonical(key), _canonical(value[key])]
+                 for key in sorted(value.keys(), key=repr)]
+        return ["dict", items]
+    raise TypeError(
+        f"approval token requires JSON values, got "
+        f"{type(value).__name__} {value!r}")
+
+
 def approval_token(tool, action, args):
-    """Deterministic token for an exact (tool, action, args) triple."""
+    """Deterministic token for an exact (tool, action, args) triple.
+
+    The canonical form is type-tagged, so ``{"x": [1, 2]}`` and
+    ``{"x": (1, 2)}`` produce *different* tokens. Raises TypeError for
+    non-string tool/action or non-JSON argument values.
+    """
+    if not isinstance(tool, str) or not isinstance(action, str):
+        raise TypeError("approval token requires string tool and action")
     canonical = json.dumps(
-        {"tool": tool, "action": action, "args": args or {}},
-        sort_keys=True, separators=(",", ":"), default=str,
+        {"tool": tool, "action": action, "args": _canonical(args or {})},
+        sort_keys=True, separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class ApprovalStore:
     def __init__(self, ttl_seconds=DEFAULT_TTL_SECONDS, clock=None):
-        """ttl_seconds: approval lifetime. clock: monotonic seconds
-        callable (default time.monotonic); injectable so tests can
-        simulate time passing deterministically."""
-        if ttl_seconds is not None and (not isinstance(ttl_seconds, (int, float))
-                                        or isinstance(ttl_seconds, bool)
-                                        or ttl_seconds <= 0):
+        """ttl_seconds: approval lifetime in seconds. Must be a positive
+        number — ``None`` (an approval that never expires) is rejected,
+        because a ``timedelta(seconds=None)`` would otherwise crash on
+        first use. clock: monotonic seconds callable (default
+        time.monotonic); injectable so tests can simulate time passing
+        deterministically."""
+        if (not isinstance(ttl_seconds, (int, float))
+                or isinstance(ttl_seconds, bool) or ttl_seconds <= 0):
             raise ValueError("ttl_seconds must be a positive number")
         self.ttl_seconds = ttl_seconds
         self._clock = clock or time.monotonic
@@ -86,7 +135,9 @@ class ApprovalStore:
 
         The request shows the exact action and arguments to the human.
         ``actor`` is the *requester* (normally the agent); the approver
-        is recorded separately by :meth:`approve`.
+        is recorded separately by :meth:`approve`. Raises TypeError when
+        the arguments contain non-JSON values (the token cannot be
+        computed for them); the gateway denies such calls outright.
         """
         token = approval_token(tool, action, args)
         now = datetime.now(timezone.utc)

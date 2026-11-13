@@ -6,6 +6,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 once it leaves 0.x. Until then, minor-version bumps may include breaking
 changes to the policy format or CLI, and those will be called out here.
 
+## [0.1.2] — 2026-11-11
+
+Robustness-fix release: a second independent re-audit confirmed all
+16 fixes from 0.1.1 hold, but found 10 new breaks — mostly the
+gateway crashing on malformed input it is documented to survive.
+All 10 are fixed here, each with a regression test in
+`tests/test_round2_fixes.py` (the suite grows 145 → 183 tests). **The
+package is still a reference implementation, not production-secure**
+— see [THREAT_MODEL.md](THREAT_MODEL.md).
+
+### Fixed
+
+- **Crash on malformed input (most serious).** `Gateway.call()` is
+  documented to never raise, but it raised on non-string file paths
+  (`123`, `None`, `["x"]`, `{"a": 1}`, `("x",)`, `3.14`, `True` —
+  `AttributeError` on `path.startswith`), `args=None` or a string
+  (`AttributeError` on `.get`), unhashable db arguments
+  (`TypeError` on a list/dict environment or table), binary files
+  with invalid UTF-8 (`UnicodeDecodeError`, only `ToolError` was
+  caught), and non-serialisable actors (`TypeError` in
+  `json.dumps`). `ToolCall.to_policy_call()` and `FakeTools.dispatch`
+  now validate/coerce argument types (deny, never raise),
+  `files_read`/`files_list`/`files_delete`/`db_query` catch
+  `OSError`/`UnicodeDecodeError` as `ToolError`, and `audit.record()`
+  coerces unserialisable fields to `str`. Both `call()` and
+  `explain()` have a last-resort safety net that turns any unexpected
+  exception into an audited denial. The fuzz tests now generate
+  non-string/malformed arguments (200 seeded trials) so "never
+  raises" is actually tested.
+- **Secret leak via audit actor/tool/action.** `audit.record()`
+  redacted only `resource` and `detail`; a secret pasted into the
+  actor, tool, or action field landed verbatim in `audit.jsonl`. All
+  free-text fields are now redacted.
+- **verify() tamper masking.** Flipping the last entry, recomputing
+  its hash, and corrupting the penultimate line made `verify()`
+  report only the corrupt line — the tamper was masked because a
+  corrupt line reset the expected chain to `None`. `verify()` now
+  judges the chain after a corrupt/non-object line against the last
+  *valid* entry's hash, so the following entry is flagged as
+  unverifiable.
+- **YAML anchors/aliases silently misparsed.** `name: &a x` parsed as
+  the literal string `"&a x"` and `tool: *x` became the glob `"*x"`.
+  The YAML-subset parser now rejects unquoted `&`/`*`/`!` tokens,
+  block scalars (`|`/`>`), and document markers (`---`/`...`) with
+  `PolicyError`. Quoted `'*'` still parses as a legal glob.
+- **YAML deep nesting.** ~2000 levels of nesting raised
+  `RecursionError`, not `PolicyError`. The parser enforces a maximum
+  nesting depth of 32.
+- **Approval token collision.** `json.dumps(default=str)` made
+  `{"x": [1, 2]}` and `{"x": (1, 2)}` produce the identical token.
+  The canonical form is now type-tagged (list vs tuple, int vs
+  string keys are distinct), and `approval_token` raises `TypeError`
+  for non-string tool/action or non-JSON argument values.
+- **ApprovalStore(ttl_seconds=None).** `timedelta(seconds=None)`
+  crashed on first use. The constructor now rejects `None` (and
+  zero/negative/non-numeric TTLs) with `ValueError`.
+- **DB credential does not gate data access (doc fix).** `db.query`
+  on staging returns rows with no secret configured
+  (`authenticated: False`). That behaviour is pinned by a test; the
+  fix is to the wording, not the tool: [THREAT_MODEL.md](THREAT_MODEL.md)
+  now says policy is the only gate and secret scoping only controls
+  credential handoff. Real deployments must authenticate in the
+  tool/MCP server itself.
+- **Env-mismatch denials are free (order fix).** Environment-mismatch
+  denials ran before the budget check, so an agent could loop them
+  without consuming budget. The budget check and charge now run
+  **before** the environment agreement check: the gateway order is
+  budget → environment agreement → policy → approval → secret →
+  execute. Every attempted call is now charged, including
+  environment-mismatched and malformed calls.
+
+### Changed
+
+- **Six false/imprecise claims corrected** (re-audit §4):
+  - "gateway never raises" — now true for `call()`/`explain()`,
+    backed by the malformed-argument fuzz tests and the safety net.
+  - "credentials never appear in logs" — now "*configured*
+    credentials" (plus the unconfigured-secret limit).
+  - "flipping a retained entry is detected" — now the precise
+    guarantee: flipping, reordering, or deleting a retained entry is
+    detected *except* a tail rewrite in which the attacker also
+    recomputes the affected hashes (pinned by a test asserting that
+    case is undetectable from the file alone).
+  - "a consumed approval can never be re-approved" — now the precise
+    property: a consumed approval *token* can never be re-approved;
+    a human may still grant a *fresh* approval for the same triple
+    on a new request.
+  - "anything outside the YAML subset raises PolicyError" — now the
+    specific rejection list (anchors, aliases, tags, block scalars,
+    document markers, depth > 32, duplicate keys, tabs).
+  - Secret scoping described as production-data protection —
+    corrected: scoping controls credential handoff; it does not gate
+    data access.
+- README, THREAT_MODEL.md, ARCHITECTURE.md, `docs/policy-guide.md`,
+  and `docs/examples-guide.md` updated to match the fixed code.
+
 ## [0.1.1] — 2026-11-11
 
 Security-fix release: an independent QA audit found 16 real

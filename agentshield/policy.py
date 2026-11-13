@@ -7,7 +7,7 @@ use glob syntax (``*`` and ``?``) via :mod:`fnmatch`.
 
 YAML subset supported (deliberately small — this is NOT a full YAML parser):
 - ``key: value`` pairs (strings, ints, floats, booleans, null)
-- nested mappings by indentation
+- nested mappings by indentation (at most ``MAX_YAML_DEPTH`` levels)
 - lists with ``- item`` and ``- key: value`` (list of maps)
 - flow collections: ``[a, b]`` and ``{k: v}`` (parsed, not left as strings)
 - ``#`` full-line comments, and `` #`` trailing comments outside quotes
@@ -15,8 +15,13 @@ YAML subset supported (deliberately small — this is NOT a full YAML parser):
 - duplicate mapping keys are rejected (last-win would silently change
   the policy)
 
-Anything outside that subset raises :class:`PolicyError`. Do not feed this
-reader arbitrary YAML and expect it to work; use JSON for complex policies.
+Rejected outright with :class:`PolicyError` (never silently
+misinterpreted): anchors (``&name``), aliases (``*name``), tags
+(``!tag``), block scalars (``|``/``>``), document markers (``---``/``...``),
+tabs for indentation, duplicate keys, unbalanced flow collections, and
+nesting deeper than ``MAX_YAML_DEPTH``. Anything outside that subset
+raises :class:`PolicyError`. Do not feed this reader arbitrary YAML and
+expect it to work; use JSON for complex policies.
 """
 
 from __future__ import annotations
@@ -200,6 +205,21 @@ def _strip_comment(line):
     return line.rstrip()
 
 
+# Maximum YAML nesting depth. Policies are shallow (a handful of
+# levels); anything deeper is treated as a hostile or broken document
+# rather than recursed into — without this, ~1000 nested levels raise
+# RecursionError instead of PolicyError.
+MAX_YAML_DEPTH = 32
+
+
+def _check_key(key):
+    """Reject YAML constructs that must never appear as a mapping key."""
+    if key and key[0] in "&*!":
+        raise PolicyError(
+            f"YAML subset: anchors, aliases and tags are not supported: {key!r}")
+    return key
+
+
 def _split_flow(inner):
     """Split a flow-collection body on top-level commas.
 
@@ -230,10 +250,13 @@ def _split_flow(inner):
     return [part.strip() for part in parts if part.strip()]
 
 
-def _parse_flow(token):
+def _parse_flow(token, depth=0):
     """Parse a flow collection token: ``[a, b]`` or ``{k: v, ...}``."""
+    if depth > MAX_YAML_DEPTH:
+        raise PolicyError(
+            f"YAML subset: nesting deeper than {MAX_YAML_DEPTH} levels")
     if token.startswith("[") and token.endswith("]"):
-        return [_scalar(item) for item in _split_flow(token[1:-1])]
+        return [_scalar(item, depth + 1) for item in _split_flow(token[1:-1])]
     if token.startswith("{") and token.endswith("}"):
         mapping = {}
         for item in _split_flow(token[1:-1]):
@@ -241,18 +264,29 @@ def _parse_flow(token):
                 raise PolicyError(
                     f"YAML subset: expected 'key: value' in flow mapping, got {item!r}")
             key, _, rest = item.partition(":")
-            key = key.strip()
+            key = _check_key(key.strip())
             if key in mapping:
                 raise PolicyError(f"YAML subset: duplicate key {key!r}")
-            mapping[key] = _scalar(rest.strip())
+            mapping[key] = _scalar(rest.strip(), depth + 1)
         return mapping
     raise PolicyError(f"YAML subset: malformed flow collection {token!r}")
 
 
-def _scalar(token):
+def _scalar(token, depth=0):
     token = token.strip()
     if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
         return token[1:-1]
+    # Anchors, aliases and tags are YAML constructs this subset does not
+    # implement: an unquoted ``&a``, ``*x`` or ``!tag`` must be rejected,
+    # not read as the literal string (a ``*x`` tool name would otherwise
+    # silently become the glob "*x"). Quoted values were handled above,
+    # so a quoted '*' stays a legal glob.
+    if token.startswith(("&", "*", "!")):
+        raise PolicyError(
+            f"YAML subset: anchors, aliases and tags are not supported: {token!r}")
+    # Block scalars and document markers are likewise unsupported.
+    if token.startswith(("|", ">")) or token in ("---", "..."):
+        raise PolicyError(f"YAML subset: unsupported construct: {token!r}")
     if token in ("true", "True"):
         return True
     if token in ("false", "False"):
@@ -264,7 +298,7 @@ def _scalar(token):
         # syntax error, not a plain string.
         if (token.startswith("[") and token.endswith("]")) or \
                 (token.startswith("{") and token.endswith("}")):
-            return _parse_flow(token)
+            return _parse_flow(token, depth)
         raise PolicyError(f"YAML subset: unbalanced flow collection {token!r}")
     try:
         return int(token)
@@ -289,16 +323,19 @@ def _parse_yaml_subset(text):
         lines.append((indent, line.strip()))
     if not lines:
         raise PolicyError("YAML subset: empty document")
-    parsed, _ = _parse_block(lines, 0, lines[0][0])
+    parsed, _ = _parse_block(lines, 0, lines[0][0], depth=0)
     if not isinstance(parsed, dict):
         raise PolicyError("YAML subset: top level must be a mapping")
     return parsed
 
 
-def _parse_block(lines, pos, indent):
+def _parse_block(lines, pos, indent, depth=0):
     """Parse a mapping or list block starting at lines[pos] with given indent."""
+    if depth > MAX_YAML_DEPTH:
+        raise PolicyError(
+            f"YAML subset: nesting deeper than {MAX_YAML_DEPTH} levels")
     if lines[pos][1].startswith("- ") or lines[pos][1] == "-":
-        return _parse_list(lines, pos, indent)
+        return _parse_list(lines, pos, indent, depth)
     mapping = {}
     while pos < len(lines):
         ind, content = lines[pos]
@@ -311,24 +348,27 @@ def _parse_block(lines, pos, indent):
         if ":" not in content:
             raise PolicyError(f"YAML subset: expected 'key: value', got: {content!r}")
         key, _, rest = content.partition(":")
-        key = key.strip()
+        key = _check_key(key.strip())
         if key in mapping:
             raise PolicyError(f"YAML subset: duplicate key {key!r}")
         rest = rest.strip()
         if rest:
-            mapping[key] = _scalar(rest)
+            mapping[key] = _scalar(rest, depth + 1)
             pos += 1
         else:
             pos += 1
             if pos >= len(lines) or lines[pos][0] <= indent:
                 mapping[key] = None
             else:
-                value, pos = _parse_block(lines, pos, lines[pos][0])
+                value, pos = _parse_block(lines, pos, lines[pos][0], depth + 1)
                 mapping[key] = value
     return mapping, pos
 
 
-def _parse_list(lines, pos, indent):
+def _parse_list(lines, pos, indent, depth=0):
+    if depth > MAX_YAML_DEPTH:
+        raise PolicyError(
+            f"YAML subset: nesting deeper than {MAX_YAML_DEPTH} levels")
     items = []
     while pos < len(lines):
         ind, content = lines[pos]
@@ -340,7 +380,7 @@ def _parse_list(lines, pos, indent):
         if not item_text:
             pos += 1
             if pos < len(lines) and lines[pos][0] > indent:
-                value, pos = _parse_block(lines, pos, lines[pos][0])
+                value, pos = _parse_block(lines, pos, lines[pos][0], depth + 1)
                 items.append(value)
             else:
                 items.append(None)
@@ -349,18 +389,18 @@ def _parse_list(lines, pos, indent):
             # A mapping starting on the dash line: "- key: value" plus
             # continuation keys indented to the dash content column.
             key, _, rest = item_text.partition(":")
-            item = {key.strip(): _scalar(rest.strip()) if rest.strip() else None}
+            item = {_check_key(key.strip()): _scalar(rest.strip(), depth + 1) if rest.strip() else None}
             pos += 1
             cont_indent = ind + 2
             while pos < len(lines) and lines[pos][0] == cont_indent and ":" in lines[pos][1]:
                 k, _, v = lines[pos][1].partition(":")
-                k = k.strip()
+                k = _check_key(k.strip())
                 if k in item:
                     raise PolicyError(f"YAML subset: duplicate key {k!r}")
-                item[k] = _scalar(v.strip()) if v.strip() else None
+                item[k] = _scalar(v.strip(), depth + 1) if v.strip() else None
                 pos += 1
             items.append(item)
         else:
-            items.append(_scalar(item_text))
+            items.append(_scalar(item_text, depth + 1))
             pos += 1
     return items, pos

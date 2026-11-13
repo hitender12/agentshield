@@ -10,10 +10,13 @@ previous entry) and ``hash`` (SHA-256 over the entry's canonical JSON
 without the hash field itself), forming a hash chain from a fixed
 genesis value. ``verify()`` recomputes the chain: flipping any field
 of any retained entry, reordering entries, or deleting a middle entry
-breaks the chain and is reported. Limits: deleting the *tail* of the
-log, or the whole file, cannot be detected from the file alone — ship
-the log to remote storage for that. ``verify()`` also never crashes on
-a corrupt line: it reports it and keeps checking the rest.
+breaks the chain and is reported. Two limits: deleting the *tail* of
+the log, or the whole file, cannot be detected from the file alone —
+and neither can a tail rewrite in which the attacker also recomputes
+the affected hashes (the rewritten tail is self-consistent). Ship the
+log to remote storage for those. ``verify()`` also never crashes on
+a corrupt line: it reports it and keeps checking the rest, judging
+the chain after a corrupt line against the last valid entry before it.
 """
 
 from __future__ import annotations
@@ -33,7 +36,8 @@ def _entry_hash(entry):
     """SHA-256 over the entry's canonical JSON, excluding its own hash."""
     canonical = {k: v for k, v in entry.items() if k != "hash"}
     return hashlib.sha256(
-        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        json.dumps(canonical, sort_keys=True, separators=(",", ":"),
+                   default=str).encode("utf-8")
     ).hexdigest()
 
 
@@ -71,12 +75,18 @@ class AuditLog:
         return GENESIS_HASH
 
     def record(self, actor, tool, action, resource, decision, outcome, detail=""):
+        """Append one entry. Every free-text field is redacted before
+        writing — actor, tool, and action as well as resource and
+        detail — so a secret pasted into any of them cannot land
+        verbatim in the log. All fields are coerced to strings, so an
+        unserializable value (e.g. an arbitrary object as actor) cannot
+        crash the write."""
         entry = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "run_id": self.run_id,
-            "actor": actor,
-            "tool": tool,
-            "action": action,
+            "actor": self.redact(str(actor)),
+            "tool": self.redact(str(tool)),
+            "action": self.redact(str(action)),
             "resource": self.redact(str(resource)),
             "decision": decision,
             "outcome": outcome,
@@ -86,7 +96,7 @@ class AuditLog:
         entry["hash"] = _entry_hash(entry)
         self._prev_hash = entry["hash"]
         with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, sort_keys=True) + "\n")
+            fh.write(json.dumps(entry, sort_keys=True, default=str) + "\n")
         return entry
 
     def read(self):
@@ -115,6 +125,7 @@ class AuditLog:
         problems = []
         entries = 0
         expected_prev = GENESIS_HASH
+        last_valid_hash = GENESIS_HASH
         try:
             fh = open(self.path, encoding="utf-8")
         except FileNotFoundError:
@@ -128,12 +139,17 @@ class AuditLog:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     problems.append(f"line {lineno}: corrupt JSON (not valid JSONL)")
-                    expected_prev = None  # chain continuity lost here
+                    # Chain continuity after a corrupt line is judged
+                    # against the last *valid* entry before it: the next
+                    # entry must chain from that hash. (Previously the
+                    # expected hash was dropped entirely, so flipping
+                    # the entry after a corrupt line went unreported.)
+                    expected_prev = last_valid_hash
                     continue
                 entries += 1
                 if not isinstance(entry, dict):
                     problems.append(f"line {lineno}: entry is not an object")
-                    expected_prev = None
+                    expected_prev = last_valid_hash
                     continue
                 missing = [f for f in REQUIRED_FIELDS if f not in entry]
                 if missing:
@@ -149,6 +165,7 @@ class AuditLog:
                             f"line {lineno}: entry hash mismatch "
                             f"(entry was modified after it was written)")
                     expected_prev = entry["hash"]
+                    last_valid_hash = entry["hash"]
                 else:
                     expected_prev = None
         return {"entries": entries, "problems": problems, "ok": not problems}

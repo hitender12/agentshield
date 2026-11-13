@@ -229,15 +229,16 @@ Notes:
 `sensitive_actions` lists actions that need a human approval even
 when a policy rule allows them. The demo policy names `delete`,
 `run`, `send`, and `buy` — the irreversible or money-spending
-actions. The gateway check order is environment agreement → budget →
+actions. The gateway check order is budget → environment agreement →
 policy → approval → secret → execute, so only a policy-allowed
 sensitive action ever reaches a human.
 
 How approvals work (`agentshield/approval.py`):
 
 - `Gateway.request_approval(call)` returns a token for the exact
-  (tool, action, args) triple — the token is the SHA-256 of the
-  canonical JSON of that triple.
+  (tool, action, args) triple — the token is the SHA-256 of a
+  type-tagged canonical form of that triple, so a list and a tuple
+  with the same items are different tokens.
 - A human approves the token after seeing the exact action and
   arguments. Rubber-stamping an approval without reading it protects
   nothing (threat-model assumption 5). Only a human may approve:
@@ -249,10 +250,15 @@ How approvals work (`agentshield/approval.py`):
   `files.delete other.txt`, and an approval for deploying service
   `web` does not cover deploying service `api`.
 - Approvals are **single-use**: once the approved call has run, the
-  same approval cannot be used again — and a consumed approval can
-  never be re-approved (replay is refused).
+  same approval cannot be used again — and a consumed approval
+  *token* can never be re-approved (replay is refused). A human may
+  still grant a *fresh* approval for the same (tool, action, args)
+  if a new request is made; the no-replay property is about the
+  token instance, not the triple.
 - Approvals **expire** (15-minute default, configurable per store).
-  An expired approval is refused, and cannot be granted late.
+  An expired approval is refused, and cannot be granted late. The
+  TTL must be a positive number — `None` (never expires) is rejected
+  at construction.
 - **Denying revokes**: `deny()` on a granted approval removes it, so
   a human who changes their mind actually stops the call.
 
@@ -287,11 +293,13 @@ Rules of the budget system (`agentshield/budget.py`):
 - **Exceeding any budget blocks everything**, and the block
   **latches** — once blocked, later calls stay blocked for the rest
   of the run.
-- **Every attempted call is charged.** Once a call passes the budget
-  check, its cost and count are recorded immediately — whether policy,
-  approval, or the tool itself then refuses it. Denied and erroring
-  calls cannot loop for free. (Calls blocked by the budget check
-  itself are not charged: the check fails before anything is recorded.)
+- **Every attempted call is charged.** The budget gate runs first:
+  once a call passes the budget check, its cost and count are
+  recorded immediately — whether environment agreement, policy,
+  approval, or the tool itself then refuses it. Environment-mismatched
+  and malformed calls are charged too, so no denial path can be looped
+  for free. (Calls blocked by the budget check itself are not charged:
+  the check fails before anything is recorded.)
 - Omit a key to leave that dimension uncapped. All three omitted
   means no budget at all — do not do that for an agent you do not
   fully trust.
@@ -333,6 +341,12 @@ Rules:
   compromised, the environment can be read directly (threat-model
   assumption 4). The broker limits *which tool* sees a credential,
   it does not protect the credential from the host.
+- Scoping is not data-access control either: handing a credential to
+  the `db` tool does not gate what the tool returns. The demo
+  database returns rows with `authenticated: False` when no credential
+  is configured; policy is the only gate on what the agent may read.
+  Real deployments must enforce authentication in the tool/MCP server
+  itself (see [THREAT_MODEL.md](../THREAT_MODEL.md)).
 
 ## JSON vs the YAML subset
 
@@ -351,6 +365,9 @@ The subset (documented in the module docstring of
 - single- and double-quoted strings
 - duplicate mapping keys are **rejected** (last-win would silently
   change the policy)
+- anchors (`&name`), aliases (`*name`), tags (`!tag`), block scalars
+  (`|`/`>`), document markers (`---`/`...`), and nesting beyond 32
+  levels are **rejected** with `PolicyError`
 
 It is **not** a full YAML parser. Anything outside the subset raises
 `PolicyError` instead of being misinterpreted. The two example

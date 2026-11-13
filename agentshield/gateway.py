@@ -1,13 +1,14 @@
-"""The gateway: route an agent's tool call through policy, approval,
-budget, and secret scoping — in that order — before the tool ever runs.
+"""The gateway: route an agent's tool call through budget, policy,
+approval, and secret scoping — in that order — before the tool ever runs.
 
 Order of checks (each denial is audited):
-0. Environment agreement — the environment the tool will actually
+0. Budget — charged FIRST, so every attempted call consumes budget,
+   including environment-mismatched and malformed ones. (Previously the
+   environment check ran first, so an agent could loop mismatched calls
+   for free.) A malformed call is charged, then denied.
+1. Environment agreement — the environment the tool will actually
    consume (taken from the call's arguments) must match the environment
-   declared on the call. A mismatch is denied before anything else.
-1. Budget — exceeded budgets block everything. Every *attempted* call
-   is charged once the budget check passes, whether policy, approval,
-   or the tool itself then refuses it.
+   declared on the call. A mismatch is denied before policy is evaluated.
 2. Policy — default deny; unknown tools/actions are denied, never allowed.
    A policy that fails to evaluate (malformed rule, bad type) denies
    the call instead of crashing the gateway.
@@ -15,6 +16,12 @@ Order of checks (each denial is audited):
 4. Secret scoping — a credential is fetched for this call only, and only
    when the tool is in the secret's scope.
 5. Execute the tool; record the outcome in the audit log (redacted).
+
+``call()`` and ``explain()`` never raise for malformed or
+attacker-controlled input: fields are sanitised at the gate, and a
+last-resort safety net turns any unexpected internal error into a
+denial. Argument values that are not JSON values cannot be approved
+(``approval_token`` raises TypeError); the gateway denies those calls.
 
 Identity: ``user``/``project`` are bound to the gateway *session* at
 construction. The per-call fields on ToolCall are caller-controlled and
@@ -35,6 +42,20 @@ from .tools import TOOL_COSTS, ToolError
 # For these, the policy resource and environment must be derived from the
 # arguments, never from a separately declared field.
 ENV_FROM_ARGS = ("db", "deploy")
+
+
+def _coerce_text(value):
+    """Coerce an attacker-controlled call field to a string.
+
+    A non-string tool/action/actor/environment becomes its ``str()``
+    form (an unknown tool then denies by default); ``None`` becomes
+    ``""``. This never raises, so the gates below can assume strings.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
 
 
 def _normalize_resource(resource):
@@ -70,13 +91,16 @@ class ToolCall:
 
         For tools whose arguments carry an environment, that argument is
         authoritative — it is what the tool reads. Otherwise the declared
-        environment is used.
+        environment is used. Non-string values never leak through: they
+        fall back to the declared environment (also coerced to a string).
         """
+        args = self.args if isinstance(self.args, dict) else {}
         if self.tool in ENV_FROM_ARGS:
-            env = self.args.get("environment")
+            env = args.get("environment")
             if isinstance(env, str) and env:
                 return env
-        return self.environment
+        declared = self.environment
+        return declared if isinstance(declared, str) else ""
 
     def to_policy_call(self, session_user=None, session_project=None):
         """Build the policy view of this call.
@@ -90,18 +114,29 @@ class ToolCall:
         tool will consume, never from the declared field alone. Identity
         comes from the gateway session when supplied; the per-call
         user/project fields are caller-controlled and ignored then.
+
+        Non-string argument values are coerced to "" for the resource,
+        so they match no allow rule and the call denies by default —
+        this method never raises on malformed input.
         """
+        args = self.args if isinstance(self.args, dict) else {}
         if self.tool == "files":
-            path = self.args.get("path", "")
-            resource = path if path.startswith("/") else f"workspace/{path}"
-            resource = _normalize_resource(resource)
+            path = args.get("path", "")
+            if not isinstance(path, str):
+                resource = ""
+            else:
+                resource = path if path.startswith("/") else f"workspace/{path}"
+                resource = _normalize_resource(resource)
         elif self.tool == "db":
-            resource = f"{self.effective_environment()}.{self.args.get('table', '')}"
+            table = args.get("table", "")
+            env = self.effective_environment()
+            resource = f"{env}.{table}" if isinstance(table, str) else ""
         elif self.tool == "deploy":
             resource = self.effective_environment()
         else:
-            resource = (self.args.get("path") or self.args.get("table")
-                        or self.args.get("environment") or "")
+            value = (args.get("path") or args.get("table")
+                     or args.get("environment") or "")
+            resource = value if isinstance(value, str) else ""
         return {
             "tool": self.tool,
             "action": self.action,
@@ -134,35 +169,73 @@ class Gateway:
         return call.to_policy_call(session_user=self.user,
                                    session_project=self.project)
 
+    def _sanitize_call(self, call):
+        """Return (sanitized ToolCall, malformed_reason).
+
+        Coerces every attacker-controlled field to a safe form: tool,
+        action, actor, and environment become strings; args must be a
+        mapping (anything else is flagged malformed and replaced with
+        ``{}``). Never raises — a call object missing attributes
+        entirely still yields a deniable call.
+        """
+        tool = _coerce_text(getattr(call, "tool", None))
+        action = _coerce_text(getattr(call, "action", None))
+        actor = _coerce_text(getattr(call, "actor", None))
+        environment = _coerce_text(getattr(call, "environment", None))
+        args = getattr(call, "args", None)
+        malformed = None
+        if not isinstance(args, dict):
+            malformed = "malformed call: args must be a mapping"
+            args = {}
+        safe = ToolCall(tool=tool, action=action, args=args, actor=actor,
+                        environment=environment)
+        return safe, malformed
+
+    def _audit_deny(self, safe, resource, reason, outcome="blocked"):
+        self.audit.record(safe.actor, safe.tool, safe.action, resource,
+                          "deny", outcome, reason)
+
     def explain(self, call):
         """Full-gate explain mode: budget + policy + approval, no execution.
 
         Answers "would this exact call be allowed?" the same way
         :meth:`call` would — including sensitive-action approval and
         budget state — without executing anything, consuming budget, or
-        consuming an approval.
+        consuming an approval. Never raises for malformed input.
         """
-        pcall = self._policy_call(call)
+        try:
+            return self._explain_inner(call)
+        except Exception as exc:  # last-resort safety net: deny, never raise
+            return Decision(False, f"Denied: internal error: {exc}",
+                            steps=[f"internal error: {exc}"])
+
+    def _explain_inner(self, call):
+        safe, malformed = self._sanitize_call(call)
+        pcall = self._policy_call(safe)
         steps = []
-        cost = TOOL_COSTS.get((call.tool, call.action), 0.0)
+        cost = TOOL_COSTS.get((safe.tool, safe.action), 0.0)
 
-        # Gate 0: environment agreement.
-        if call.tool in ENV_FROM_ARGS and call.effective_environment() != call.environment:
-            steps.append(
-                f"environment mismatch: declared {call.environment!r} but "
-                f"arguments would execute against {call.effective_environment()!r}")
-            return Decision(False,
-                            "Denied: environment mismatch between call and arguments",
-                            steps=steps)
-        steps.append("environment: declared and argument environments agree")
+        if malformed is not None:
+            steps.append(f"malformed call: {malformed}")
+            return Decision(False, f"Denied: {malformed}", steps=steps)
 
-        # Gate 1: budget (probe only — never records, never latches).
+        # Gate 0: budget (probe only — never records, never latches).
         ok, reason = self.budgets.would_allow(cost)
         if not ok:
             steps.append(f"budget: would block ({reason})")
             return Decision(False, f"Denied: budget would block this call: {reason}",
                             steps=steps)
         steps.append("budget: within limits")
+
+        # Gate 1: environment agreement.
+        if safe.tool in ENV_FROM_ARGS and safe.effective_environment() != safe.environment:
+            steps.append(
+                f"environment mismatch: declared {safe.environment!r} but "
+                f"arguments would execute against {safe.effective_environment()!r}")
+            return Decision(False,
+                            "Denied: environment mismatch between call and arguments",
+                            steps=steps)
+        steps.append("environment: declared and argument environments agree")
 
         # Gate 2: policy.
         try:
@@ -176,15 +249,21 @@ class Gateway:
                             matched_rules=decision.matched_rules, steps=steps)
 
         # Gate 3: approval for sensitive actions (peek, never consume).
-        if self.policy.is_sensitive(call.action):
-            if self.approvals.has_approval(call.tool, call.action, call.args):
+        if self.policy.is_sensitive(safe.action):
+            try:
+                approved = self.approvals.has_approval(
+                    safe.tool, safe.action, safe.args)
+            except Exception:
+                # Non-JSON arguments cannot be approved: deny.
+                approved = False
+            if approved:
                 steps.append("approval: granted for these exact arguments")
             else:
                 steps.append("approval: required, none granted for these exact arguments")
                 return Decision(
                     False,
                     f"Denied: approval required for sensitive action "
-                    f"{call.tool}.{call.action}",
+                    f"{safe.tool}.{safe.action}",
                     matched_rules=decision.matched_rules, steps=steps)
 
         steps.append("all gates pass")
@@ -197,77 +276,116 @@ class Gateway:
         The agent requests; a human grants out of band (see
         :mod:`agentshield.approval`). There is deliberately no gateway
         method to approve — the agent cannot approve its own calls.
+        Raises TypeError when the arguments contain non-JSON values
+        (no token can be computed for them).
         """
-        return self.approvals.request(call.tool, call.action, call.args,
-                                      actor=call.actor)
+        safe, malformed = self._sanitize_call(call)
+        if malformed is not None:
+            raise TypeError(malformed)
+        return self.approvals.request(safe.tool, safe.action, safe.args,
+                                      actor=safe.actor)
 
     def call(self, call):
-        """Route one call. Returns a result dict; never raises for denials."""
-        # 0. Environment agreement: the tool must execute against the
-        # environment the call declares. Anything else is denied outright
-        # — policy must never be evaluated on one environment while the
-        # tool runs against another.
-        if call.tool in ENV_FROM_ARGS and call.effective_environment() != call.environment:
-            resource = self._policy_call(call)["resource"]
-            reason = (f"environment mismatch: call declares "
-                      f"{call.environment!r} but arguments would execute "
-                      f"against {call.effective_environment()!r}")
-            self.audit.record(call.actor, call.tool, call.action, resource,
-                              "deny", "blocked", reason)
-            return {"allowed": False, "reason": reason, "result": None}
+        """Route one call. Returns a result dict; never raises."""
+        try:
+            return self._call_inner(call)
+        except Exception as exc:  # last-resort safety net: deny, never raise
+            try:
+                self.audit.record("gateway", "gateway", "call", "", "deny",
+                                  "blocked", f"internal error: {exc}")
+            except Exception:
+                pass
+            return {"allowed": False,
+                    "reason": f"Denied: internal error: {exc}",
+                    "result": None}
 
-        pcall = self._policy_call(call)
-        resource = pcall["resource"]
-        cost = TOOL_COSTS.get((call.tool, call.action), 0.0)
+    def _call_inner(self, call):
+        safe, malformed = self._sanitize_call(call)
+        cost = TOOL_COSTS.get((safe.tool, safe.action), 0.0)
 
-        # 1. Budget.
+        # 0. Budget — charged FIRST, so every attempted call consumes
+        # budget, including environment-mismatched and malformed ones.
         ok, reason = self.budgets.check(cost)
         if not ok:
-            self.audit.record(call.actor, call.tool, call.action, resource,
-                              "deny", "blocked", reason)
+            self._audit_deny(safe, "", reason)
             return {"allowed": False, "reason": reason, "result": None}
         # Charge the attempt now: denied and erroring calls consume
         # budget too, so they cannot loop for free.
         self.budgets.record(cost)
+
+        if malformed is not None:
+            self._audit_deny(safe, "", malformed)
+            return {"allowed": False, "reason": malformed, "result": None}
+
+        # 1. Environment agreement: the tool must execute against the
+        # environment the call declares. Anything else is denied outright
+        # — policy must never be evaluated on one environment while the
+        # tool runs against another.
+        if safe.tool in ENV_FROM_ARGS and safe.effective_environment() != safe.environment:
+            resource = self._policy_call(safe)["resource"]
+            reason = (f"environment mismatch: call declares "
+                      f"{safe.environment!r} but arguments would execute "
+                      f"against {safe.effective_environment()!r}")
+            self._audit_deny(safe, resource, reason)
+            return {"allowed": False, "reason": reason, "result": None}
+
+        pcall = self._policy_call(safe)
+        resource = pcall["resource"]
 
         # 2. Policy (default deny; evaluation errors deny, never crash).
         try:
             decision = self.engine.evaluate(pcall)
         except Exception as exc:
             reason = f"policy evaluation error: {exc}"
-            self.audit.record(call.actor, call.tool, call.action, resource,
-                              "deny", "blocked", reason)
+            self._audit_deny(safe, resource, reason)
             return {"allowed": False, "reason": reason, "result": None}
         if not decision.allowed:
-            self.audit.record(call.actor, call.tool, call.action, resource,
-                              "deny", "blocked", decision.reason)
+            self._audit_deny(safe, resource, decision.reason)
             return {"allowed": False, "reason": decision.reason, "result": None}
 
         # 3. Human approval for sensitive actions.
-        if self.policy.is_sensitive(call.action):
-            if not self.approvals.is_approved(call.tool, call.action, call.args):
-                token = approval_token(call.tool, call.action, call.args)
+        if self.policy.is_sensitive(safe.action):
+            try:
+                approved = self.approvals.is_approved(
+                    safe.tool, safe.action, safe.args)
+            except Exception:
+                # Non-JSON arguments cannot be approved: deny.
+                self._audit_deny(safe, resource,
+                                 "approval cannot be verified for non-JSON arguments")
+                return {"allowed": False,
+                        "reason": "Denied: approval cannot be verified for "
+                                  "non-JSON arguments",
+                        "result": None}
+            if not approved:
+                try:
+                    token = approval_token(safe.tool, safe.action, safe.args)
+                except Exception:
+                    self._audit_deny(safe, resource,
+                                     "approval cannot be requested for non-JSON arguments")
+                    return {"allowed": False,
+                            "reason": "Denied: approval cannot be requested for "
+                                      "non-JSON arguments",
+                            "result": None}
                 reason = ("approval required for sensitive action "
-                          f"{call.tool}.{call.action} (request {token[:16]})")
-                self.audit.record(call.actor, call.tool, call.action, resource,
-                                  "deny", "awaiting-approval", reason)
+                          f"{safe.tool}.{safe.action} (request {token[:16]})")
+                self._audit_deny(safe, resource, reason, outcome="awaiting-approval")
                 return {"allowed": False, "reason": reason, "result": None,
                         "approval_token": token}
 
         # 4. Scoped secret, fetched for this call only.
         secret = None
-        if call.tool == "db":
-            secret = self.broker.get("DB_PASSWORD", call.tool)
+        if safe.tool == "db":
+            secret = self.broker.get("DB_PASSWORD", safe.tool)
 
         # 5. Execute and audit (redacted).
         try:
-            result = self.tools.dispatch(call.tool, call.action, call.args,
+            result = self.tools.dispatch(safe.tool, safe.action, safe.args,
                                          secret=secret)
         except ToolError as exc:
-            self.audit.record(call.actor, call.tool, call.action, resource,
+            self.audit.record(safe.actor, safe.tool, safe.action, resource,
                               "allow", "error", str(exc))
             return {"allowed": True, "reason": "allowed by policy; tool errored",
                     "result": None, "error": str(exc)}
-        self.audit.record(call.actor, call.tool, call.action, resource,
+        self.audit.record(safe.actor, safe.tool, safe.action, resource,
                           "allow", "ok", f"cost={cost}")
         return {"allowed": True, "reason": "allowed by policy", "result": result}

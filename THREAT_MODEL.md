@@ -14,12 +14,12 @@ deleting files, deploying, or spending money without approval.
 
 | Asset | Protected by |
 |---|---|
-| Production data (prod DB) | Policy deny rules (`deny-db-prod`); secret scoping (DB credential only handed to the `db` tool, only for allowed calls); environment agreement — the environment and resource are derived from the arguments the tool will consume, and a call whose declared environment disagrees with its arguments is denied before policy is even evaluated |
+| Production data (prod DB) | Policy deny rules (`deny-db-prod`); environment agreement — the environment and resource are derived from the arguments the tool will consume, and a call whose declared environment disagrees with its arguments is denied before policy is even evaluated. Secret scoping is **not** a data-access control: the DB credential is handed only to the `db` tool for allowed calls, but it does **not** gate reads — the demo database returns rows with `authenticated: False` when no credential is configured. Real deployments must enforce authentication in the tool/MCP server itself. |
 | Files outside the workspace | Policy resource globs on normalised resources (`workspace/../x` resolves to `x` and matches no workspace rule) + the file tool's own `realpath` symlink/containment check (defense in depth) |
-| Irreversible actions (delete/deploy/send/buy) | Human approval bound to exact arguments; single-use with no replay (consumed tokens can never be re-approved); deny revokes; 15-minute expiry; only a human may grant an approval — the gateway exposes no approve method |
-| Runaway cost / tool-call loops | Call, time, and cost budgets (blocks latch); every attempted call is charged once it passes the budget check, so denied and erroring calls cannot loop for free |
-| Secrets in logs | Broker redaction before audit writes — every configured secret is registered at startup, any length, and unscoped secrets are denied by default |
-| Accountability | Append-only, hash-chained audit log with actor, decision, resource, outcome; `verify()` detects flipped, reordered, or deleted retained entries |
+| Irreversible actions (delete/deploy/send/buy) | Human approval bound to exact arguments; single-use with no replay (a consumed approval *token* can never be re-approved — though a human may grant a *fresh* approval for the same triple on a new request); deny revokes; 15-minute expiry; only a human may grant an approval — the gateway exposes no approve method |
+| Runaway cost / tool-call loops | Call, time, and cost budgets (blocks latch); the budget gate runs first, so every attempted call is charged — including environment-mismatched and malformed calls — and denied and erroring calls cannot loop for free |
+| Secrets in logs | Broker redaction before audit writes — every *configured* secret is registered at startup, any length, redacted from every free-text audit field, and unscoped secrets are denied by default. A secret the broker was never configured with cannot be redacted. |
+| Accountability | Append-only, hash-chained audit log with actor, decision, resource, outcome; `verify()` detects flipped, reordered, or deleted retained entries — except a tail rewrite in which the attacker also recomputes the affected hashes |
 
 ## Assumptions (the gateway's security depends on these)
 
@@ -63,7 +63,9 @@ deleting files, deploying, or spending money without approval.
   convention in this implementation, with hash chaining as tamper
   evidence: flipping, reordering, or deleting a *retained* entry breaks
   the chain and is detected by `verify()`. Deleting the *tail* of the
-  log, or the whole file, still cannot be detected from the file alone.
+  log, or the whole file, still cannot be detected from the file alone —
+  and neither can a tail rewrite in which the attacker also recomputes
+  the affected hashes (the rewritten tail is self-consistent).
   Tamper *proof* (signatures, remote shipping) is a later milestone.
 - **Timing and concurrency attacks.** This reference implementation is
   single-process and in-memory; it has no locking, no rate limiting
@@ -74,15 +76,23 @@ deleting files, deploying, or spending money without approval.
 - No real MCP transport; demo tools are local fakes.
 - Policy and approvals live in memory; restarting loses pending approvals.
 - The YAML reader is a documented subset, not full YAML — it parses flow
-  collections and rejects duplicate keys, but malformed input outside
-  the subset raises an error rather than being misinterpreted.
+  collections and rejects duplicate keys, anchors, aliases, tags, block
+  scalars, document markers, and nesting beyond 32 levels, but malformed
+  input outside the subset raises an error rather than being misinterpreted.
+- The demo database does not enforce authentication: `db.query` returns
+  rows with `authenticated: False` when no credential is configured. The
+  credential proves the broker handed it to the call; it does not gate
+  data access. Real deployments must enforce authentication in the
+  tool/MCP server itself.
 - Audit `verify()` checks structure and the hash chain, not signatures.
-  Tail deletion is undetectable from the file alone.
+  Tail deletion — and a tail rewrite with recomputed hashes — is
+  undetectable from the file alone.
 - Cost accounting uses static per-tool prices, not measured spend.
 - Seeded fuzz tests over random policies and calls exist
-  (`tests/test_security_fixes.py`); they assert the gateway never
-  raises and deny-by-default always holds, but they are not a
-  penetration test.
+  (`tests/test_security_fixes.py`, `tests/test_round2_fixes.py`); they
+  assert the gateway never raises — including on malformed, non-string,
+  and non-JSON arguments — and deny-by-default always holds, but they
+  are not a penetration test.
 
 ## Security status
 
